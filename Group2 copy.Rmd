@@ -1,0 +1,836 @@
+---
+title: "Group 2: Final Project Report"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+---
+
+***
+(Note: This was a group project, but I am only including the work I did)
+
+## **Research Question** 
+
+Our major question with this project revolved around setting up a 'schedule' for a prospective Uber driver in NYC to give themselves in order to maximize the number of rides they could give.
+
+**Datasets Used** 
+[Uber Pickups in New York City](https://www.kaggle.com/datasets/fivethirtyeight/uber-pickups-in-new-york-city)
+
+[NYC Taxi Zones](https://www1.nyc.gov/site/tlc/about/tlc-trip-record-data.page)
+
+Libraries:
+```{r, echo=TRUE}
+library(tidyverse) # For mutation/transformation/visualization of data
+library(reshape) # To aid with visualizing data
+library(lubridate) # For conversion/separation of date/time data
+library(gridExtra) # For making grids
+library(sf) # For handling the taxi zone data
+library(ggdendro) # For making dendrograms while performing hierarchical clustering
+library(sjPlot) # For plotting interaction data
+library(DT)
+library(scales)
+```
+
+
+## **John**
+
+## Cleaning
+
+The first step (obviously) was loading the appropriate libraries and reading/cleaining the data. I am excluding the chunk that contains most of the preliminary cleaning; the only thing of note there was that I created individual `year`,`month`, `day`, `hour`, and `weekdays` variables.
+```{r, echo=FALSE}
+janjune_15 <- read.csv("/Users/john/Desktop/uber-raw-data-janjune-15.csv")
+# Removing these variables, as we will not be using them
+janjune_15 <- janjune_15[, -c(1,3)]
+
+# Create separate columns that will contain the month, day, year, and day of the week (as well as pickup time and hour)
+janjune_15$Pickup_date <- ymd_hms(janjune_15$Pickup_date)
+
+janjune_15 <- janjune_15 %>%
+  mutate_at(vars(Pickup_date), funs(year, month, day, weekdays)) %>%
+  mutate(time = format(Pickup_date, "%H:%M"),
+         hour = hour(Pickup_date))
+# Removing full date and year columns, as they are unnecessary 
+janjune_15 <- janjune_15[, -c(1, 3)]
+
+#Renaming this for merging convenience with the taxi dataset
+janjune_15 <- janjune_15 %>% dplyr::rename(LocationID = locationID)
+
+# Removing these 2 locations, as they are not part of the NYC taxi location map
+`%!in%` <- Negate(`%in%`)
+janjune_15 <- filter(janjune_15, LocationID %!in% c(264,265))
+
+# Reorder weekdays so that they will appear in conventional order when graphed
+janjune_15$weekdays <- factor(janjune_15$weekdays, levels = c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"))
+janjune_15 <- janjune_15[order(janjune_15$weekdays), ]
+
+taxi_locs <- st_read("/Users/john/Desktop/taxi_zones/taxi_zones.shp")
+#renaming duplicates
+taxi_locs[57, 5] = 57
+taxi_locs[104, 5] = 104
+taxi_locs[105, 5] = 105
+```
+
+This part of the cleaning, however, I believe is important. I transformed the UTM coordinates from the taxi data to standard Latitude/Longitude coordinates, and then found the centroid of each `LocationID` polygon, which was necessary for doing clustering later on.
+
+```{r, echo=TRUE}
+#convert from UTM coordinates to regular lat/long
+taxi_coords <- taxi_locs[,c("geometry", "LocationID")]
+taxi_coords <- st_transform(taxi_coords, "+proj=longlat")
+
+
+# Finding the center of each zone
+taxi_coords <- taxi_coords %>% 
+  mutate(lon = map_dbl(geometry, ~st_centroid(.x)[[1]]), 
+         lat = map_dbl(geometry, ~st_centroid(.x)[[2]]))
+
+taxi_locs$lon <- taxi_coords$lon
+taxi_locs$lat <- taxi_coords$lat
+```
+
+## Preliminary Visualization
+
+I wanted to get an early look at the data to see if there were any obvious trends which could help me narrow my focus. I thought the trick I did with the `alpha` level on the boroughs was pretty clever, and it made very clear where most of the activity was.
+
+```{r, echo=FALSE}
+# Creating map of the taxi location IDs
+jj15_locs <- janjune_15 %>% group_by(LocationID) %>%
+  count(LocationID)
+
+locs_n <- taxi_locs %>% left_join(jj15_locs, by = "LocationID")
+
+
+ggplot(data = locs_n) + 
+  geom_sf(aes(fill = n), size = .2) +
+  scale_fill_gradient(low = "#FFFFFF", high = "#2e6c53") +
+  coord_sf() +
+  theme(panel.background = element_rect(fill = "ghostwhite")) +
+  theme(panel.grid.major = element_blank()) +
+  labs(title = "Heatmap of Rides by Location")
+
+
+ggplot(data = locs_n) + 
+  geom_sf(aes(fill = borough, alpha = n), col = "grey40", size = .2) +
+  coord_sf() +
+  scale_alpha_continuous(guide = "none", range = c(0.05,1)) +
+  theme(panel.background = element_rect(fill = "ghostwhite")) +
+  theme(panel.grid.major = element_blank()) + 
+  labs(title = "Heatmap of Rides by Location Highlighting Boroughs")
+```
+
+## Further Cleaning and Early Aggregation
+
+I noticed that the rides were almost entirely concentrated in Manhattan, Brooklyn, and Queens, so I removed the other boroughs from my data, as well as some of the irrelevant locations within the remaining boroughs.
+
+I also had the idea to find ways to aggregate the data to make it easier and more realistic to work with, as opposed to counting each hour of the day and each location in the map separately. Grouping them would make sense, as people who work typically do so for several hours in a row, and, for a job like driving, it makes sense to confine oneself to a single general area.
+
+Note that `relevant_locs` exists purely for aesthetic purposes; I didn't like how the maps looked with the `zoomed_locs` floating in space, so I added it to make the picture better.
+
+```{r, echo=TRUE}
+relevant_locs <- filter(locs_n, borough %in% c("Brooklyn", "Queens", "Manhattan"))
+
+bad_locs <- c(14, 201, 27, 117, 86, 55, 154, 2, 29, 150, 108, 210, 154, 200, 240, 259, 254, 81, 51, 184, 101, 19, 64, 30, 119, 235, 243, 169, 20, 78, 243, 203, 38, 191, 155, 123, 21, 22, 11, 26, 67, 91, 149, 228, 227, 128, 127, 153, 136, 235, 47, 174, 18, 247, 69, 120, 244, 178, 165, 139, 105, 195, 104, 103)
+relevant_locs <- filter(relevant_locs, LocationID %!in% bad_locs)
+
+# Using the summary data to decide which locations to keep
+summary(jj15_locs)
+zoomed_locs <- filter(locs_n, n > 58035)
+
+# Updating the dataset to match zoomed_locs
+jj15_locs <- filter(jj15_locs, LocationID %in% zoomed_locs$LocationID)
+janjune_15 <- filter(janjune_15, LocationID %in% zoomed_locs$LocationID)
+
+
+# Condensing the hour variable into three 8-hour stretches of time, both for convenience
+# and to get results based on a 'shift,' with the research question in mind
+janjune_15$period <- with(janjune_15, 
+                         ifelse(hour >= 3 & hour <= 10, "morning",
+                         ifelse(hour > 10 & hour <= 18, "noon", "night")))
+
+# A demonstration of my better view of the relevant data
+ggplot(data = zoomed_locs) + 
+  geom_sf(aes(fill = n), size = 0) +
+  scale_fill_gradient(low = "#cdf2d8", high = "#004731") +
+  coord_sf() +
+  geom_sf(data = relevant_locs, alpha = .05, col = "grey10", size = .1) +
+  theme(axis.text.x=element_text(angle=25,hjust=1)) +
+  theme(panel.background = element_rect(fill = "ghostwhite")) +
+  theme(panel.grid.major = element_blank()) +
+  labs(title = "Heatmap of Rides by Location, Better View")
+```
+
+I then created variables for the total number of trips by location over a period of time (3-10AM is `morning`, 11AM-6PM is `noon`, and 7PM-2AM is `night`). I'm sure I did this very inefficiently; it would probably be one of the first things I would try to fix, given more time.
+
+```{r, echo=FALSE}
+jj_15_hrloc <- janjune_15 %>% group_by(LocationID) %>%
+  count(hour, LocationID)
+
+jj_15_mornloc <- filter(jj_15_hrloc, hour %in% c(3:10))
+jj_15_noonloc <- filter(jj_15_hrloc, hour %in% c(11:18))
+jj_15_nightloc <- filter(jj_15_hrloc, hour %in% c(19:23, 0:2))
+
+jj_15_mornloc <-  ungroup(jj_15_mornloc)
+jj_15_mornloc <- aggregate(jj_15_mornloc$n, by = list(jj_15_mornloc$LocationID), FUN = sum)
+jj_15_mornloc <- jj_15_mornloc %>% dplyr::rename(LocationID = Group.1, morn = x)
+
+jj_15_noonloc <-  ungroup(jj_15_noonloc)
+jj_15_noonloc <- aggregate(jj_15_noonloc$n, by = list(jj_15_noonloc$LocationID), FUN = sum)
+jj_15_noonloc <- jj_15_noonloc %>% dplyr::rename(LocationID = Group.1, noon = x)
+
+jj_15_nightloc <-  ungroup(jj_15_nightloc)
+jj_15_nightloc <- aggregate(jj_15_nightloc$n, by = list(jj_15_nightloc$LocationID), FUN = sum)
+jj_15_nightloc <- jj_15_nightloc %>% dplyr::rename(LocationID = Group.1, night = x)
+
+zoomed_locs <- zoomed_locs %>% left_join(jj_15_mornloc, by = "LocationID") %>% 
+  left_join(jj_15_noonloc, by = "LocationID") %>% 
+  left_join(jj_15_nightloc, by = "LocationID")
+```
+
+Visualizing/Comparing number of rides over each period of the day
+
+```{r, echo=FALSE}
+ggplot(data = zoomed_locs) + 
+  geom_sf(aes(fill = morn), size = 0) +
+  scale_fill_gradient(low = "#cdf2d8", high = "#004731") +
+  coord_sf() +
+  geom_sf(data = relevant_locs, col = "grey20", alpha = .05, size = .1) +
+  theme(axis.text.x=element_text(angle=25,hjust=1)) +
+  theme(panel.background = element_rect(fill = "ghostwhite")) +
+  theme(panel.grid.major = element_blank()) +
+  labs(title = "Rides from 3AM-10AM")
+
+ggplot(data = zoomed_locs) + 
+  geom_sf(aes(fill = noon), size = 0) +
+  scale_fill_gradient(low = "#cdf2d8", high = "#004731") +
+  coord_sf() +
+  geom_sf(data = relevant_locs, col = "grey20", alpha = .05, size = .1) +
+  theme(axis.text.x=element_text(angle=25,hjust=1)) +
+  theme(panel.background = element_rect(fill = "ghostwhite")) +
+  theme(panel.grid.major = element_blank()) +
+  labs(title = "Rides from 11AM-6PM")
+
+ggplot(data = zoomed_locs) + 
+  geom_sf(aes(fill = night), size = 0) +
+  scale_fill_gradient(low = "#cdf2d8", high = "#004731") +
+  coord_sf() +
+  geom_sf(data = relevant_locs, col = "grey20", alpha = .05, size = .1) +
+  theme(axis.text.x=element_text(angle=25,hjust=1)) +
+  theme(panel.background = element_rect(fill = "ghostwhite")) +
+  theme(panel.grid.major = element_blank()) +
+  labs(title = "Rides from 7PM-2AM")
+```
+
+This chunk is probably unnecessary, but I wanted to see the most active locations, out of curiosity.
+
+```{r, echo=FALSE}
+nsort <- zoomed_locs[order(-zoomed_locs$n),]
+top15tot <- nsort[1:15,]
+
+ggplot(data = top15tot) + 
+  geom_sf(aes(fill = n), size = 0) +
+  scale_fill_gradient(low = "#cdf2d8", high = "#004731") +
+  coord_sf() +
+  geom_sf(data = zoomed_locs, col = "black", alpha = .1, size = .15) +
+  geom_sf(data = relevant_locs, alpha = .1, col = "grey65", size = .1) +
+  theme(axis.text.x=element_text(angle=25,hjust=1)) +
+  theme(panel.background = element_rect(fill = "ghostwhite")) +
+  theme(panel.grid.major = element_blank()) +
+  labs(title = "15 Most Active Locations")
+
+morn_sort <- zoomed_locs[order(zoomed_locs$morn, decreasing = TRUE),]
+top15morn <- morn_sort[1:15,]
+
+noon_sort <- zoomed_locs[order(zoomed_locs$noon, decreasing = TRUE),]
+top15noon <- noon_sort[1:15,]
+
+night_sort <- zoomed_locs[order(zoomed_locs$night, decreasing = TRUE),]
+top15night <- night_sort[1:15,]
+
+
+
+ggplot(data = top15morn) + 
+  geom_sf(aes(fill = morn), size = 0) +
+  scale_fill_gradient(low = "#cdf2d8", high = "#004731") +
+  coord_sf() +
+  geom_sf(data = zoomed_locs, col = "grey10", alpha = .1, size = .15) +
+  geom_sf(data = relevant_locs, alpha = .05, col = "grey75", size = .1) +
+  theme(axis.text.x=element_text(angle=25,hjust=1)) +
+  theme(panel.background = element_rect(fill = "ghostwhite")) +
+  theme(panel.grid.major = element_blank()) +
+  labs(title = "15 Most Active Locations (Morning)")
+
+ggplot(data = top15noon) + 
+  geom_sf(aes(fill = noon), size = 0) +
+  scale_fill_gradient(low = "#cdf2d8", high = "#004731") +
+  coord_sf() +
+  geom_sf(data = zoomed_locs, col = "grey10", alpha = .1, size = .15) +
+  geom_sf(data = relevant_locs, alpha = .05, col = "grey75", size = .1) +
+  theme(axis.text.x=element_text(angle=25,hjust=1)) +
+  theme(panel.background = element_rect(fill = "ghostwhite")) +
+  theme(panel.grid.major = element_blank()) +
+  labs(title = "15 Most Active Locations (Afternoon)")
+
+ggplot(data = top15night) + 
+  geom_sf(aes(fill = night), size = 0) +
+  scale_fill_gradient(low = "#cdf2d8", high = "#004731") +
+  coord_sf() +
+  geom_sf(data = zoomed_locs, col = "grey10", alpha = .1, size = .15) +
+  geom_sf(data = relevant_locs, alpha = .05, col = "grey75", size = .1) +
+  theme(axis.text.x=element_text(angle=25,hjust=1)) +
+  theme(panel.background = element_rect(fill = "ghostwhite")) +
+  theme(panel.grid.major = element_blank()) +
+  labs(title = "15 Most Active Locations (Night)")
+```
+
+
+## Early Modeling and Checking
+
+My first thought was to conduct ANOVA tests to see if the means across certain variables could be considered equivalent. I found that there was insignificant difference in average trips across the days of the week, and significant differences across both hours of the day and my new `period` variable. 
+
+I then ran several linear regressions on various aggregations of the data. Much like the ANOVA testing, these revealed `weekdays` to be statistically insignificant (though perhaps worth keeping in the model, as I obtained better $$R^2$$ values with `weekdays` included), and `hour` and `period` (for all factors) both to be significant.
+
+I would like to note that, while `month` was found to be statistically significant, I chose to ignore it, as much of its significance can probably be attributed to [Uber's growth as a company in 2015](https://www.businessinsider.com/uber-doubles-its-drivers-in-2015-2015-10). 
+
+The final model, using `LocationID` and `period`, gave me the idea to try clustering the data. But first I wanted to visualize the other models.
+
+```{r}
+# ANOVA tests to see if there is a difference in trips per day of the week and over the 3 periods of time throughout the day, followed by linear regressions
+weekday_period <- group_by(janjune_15, weekdays, period) %>%
+  count(weekdays, period)
+weekday_hour <- group_by(janjune_15, weekdays, hour) %>%
+  count(weekdays, hour)
+mon <- janjune_15 %>% count(month) 
+
+oneway.test(n ~ weekdays, data = weekday_period)
+oneway.test(n ~ period, data = weekday_period)
+oneway.test(n ~ hour, data = weekday_hour)
+summary(lm(n ~ ., data = mon))
+lm.wkd.per <- lm(n ~ ., data = weekday_period)
+summary(lm.wkd.per)
+lm.per <- lm(n ~ period, data = weekday_period)
+summary(lm.per)
+lm.hr <- lm(n ~ hour, data = weekday_hour)
+summary(lm.hr)
+
+# predicted_per <- data.frame(per_pred = predict(lm.wkd.per, weekday_period), n=weekday_period$n)
+
+# predicted_hr <- data.frame(hr_pred = predict(lm.hr, weekday_hour), n=weekday_period$n)
+
+jj15_perloc <- janjune_15 %>% group_by(period, LocationID) %>%
+  count(period, LocationID)
+lm.perloc <- lm(n ~ ., data = jj15_perloc)
+summary(lm.perloc)
+```
+
+The graphs below mostly confirm what the models told me. The `LocationID` vs. `period` graph can be disregarded, as another issue with these Location IDs is that they aren't in any discernible order, so looking for any 'horizontal' trends in the graph is useless. Also important to note that the fit of `lm.perloc` to the aforementioned graph was so bad that I chose to exclude it.
+
+```{r, echo=FALSE}
+weekday_hr <- group_by(janjune_15, weekdays, hour) %>%
+  count(weekdays, hour)
+
+# Need to convert to df in order to melt (which makes graphing easier), since dplyr doesn't return it as a dataframe for some reason
+weekday_hr <- as.data.frame(weekday_hr)
+weekday_hr <- melt(weekday_hr, id.vars = c("hour", "weekdays", "n"))
+
+wd_cols <-c("red", "orange", "green", "green4", "turquoise", "blue", "purple")
+ggplot(weekday_hr, aes(hour, n, col = weekdays)) +
+  geom_line() +
+  geom_smooth(se = F, col = "black", size = 1.5, lty = 2, method = "loess", formula = 'y ~ x') + 
+  geom_smooth(se = F, col = "black", size = .5, lty = 3, method = "lm", formula = 'y ~ x') +
+  scale_color_manual(values = wd_cols) +
+  scale_x_continuous(breaks = seq(min(weekday_hr$hour), max(weekday_hr$hour), 2)) +
+  geom_vline(xintercept = 2, alpha = .5) + 
+  geom_vline(xintercept = 11, alpha = .5) +
+  geom_vline(xintercept = 19, alpha = .5) +
+  labs(title = "Activity by Weekday by Hour")
+
+
+jj15_wkhr <- janjune_15 %>% group_by(weekdays, period) %>%
+  count(weekdays)
+ggplot(data = jj15_wkhr, aes(x = weekdays, y = n)) +
+  geom_point(aes(pch = period, col = period), size = 3.5) +
+  theme(axis.text.x=element_text(angle=25,hjust=1)) +
+  labs(title = "Rides by Weekday and Period")
+
+ggplot(data = zoomed_locs) +
+  geom_point(aes(x = LocationID, y = morn, col = "Morning", pch = "Morning"), size = 2.5) +
+  geom_point(aes(x = LocationID, y = noon, col = "Afternoon", pch = "Afternoon"), size = 2.5) +
+  geom_point(aes(x = LocationID, y = night, col = "Night", pch = "Night"), size = 2.5) +
+  labs(y = "n", color = "Legend") +
+  scale_color_manual(name = "Legend", breaks = c("Morning", "Afternoon", "Night"), values = c("Morning" = "red", "Afternoon" = "blue", "Night" = "green4")) +
+  scale_shape_manual(name = "Legend", breaks = c("Morning", "Afternoon", "Night"), values = c("Morning" = 1, "Afternoon" = 0, "Night" = 2)) +
+   scale_x_continuous(breaks = seq(min(zoomed_locs$LocationID), max(zoomed_locs$LocationID), 20)) +
+  labs(title = "Activity by Location ID and period")
+```
+
+
+## Forming Clusters
+
+I was concerned about how clustering algorithms would arrange the data. Primarily, I thought that they may form clusters containing locations from both Manhattan and Brooklyn/Queens, which I considered to be suboptimal in a realistic setting, as these areas can only be accessed by bridge (for a driver), and bridges are notoriously high-traffic zones. So I first formed my own hypothesized groups, based on what I thought would be a sensible 'jurisdiction' for an Uber driver to have. Moreover, I thought that the two airports could be groups by themselves, for two reasons:
+1. They are geographically isolated from the rest of the relevant locations (especially JFK)
+2. Many airports have contracts with Uber, even providing designated pick-up and drop-off areas for drivers. I can only assume that these benefits come with some form of extra compensation for drivers giving rides to/from airports.
+
+```{r, echo=FALSE}
+# Geographically grouping the locations
+zoomed_locs$Group <- as.factor(ifelse(zoomed_locs$LocationID == 132, "jfk", ifelse(zoomed_locs$borough %in% c("Brooklyn", "Queens") & zoomed_locs$LocationID != 138, "east", ifelse(zoomed_locs$LocationID == 138, "lga", "manhattan"))))
+
+grp_cols <-c("#70AE98", "#ECBE7A", "#E58B88", "#9DABDD")
+ggplot(data = zoomed_locs) + 
+  geom_sf(aes(fill = Group), size = 0) +
+  # scale_fill_gradient(low = "#cdf2d8", high = "#004731") +
+  coord_sf() +
+  geom_sf(data = relevant_locs, col = "grey20", alpha = .05, size = .2) +
+  theme(axis.text.x=element_text(angle=25,hjust=1)) +
+  scale_fill_manual(values = grp_cols) +
+  theme(panel.background = element_rect(fill = "ghostwhite")) +
+  theme(panel.grid.major = element_blank())
+```
+
+
+```{r, echo=FALSE}
+# adding the groups to the main dataframe; this takes a very long time
+janjune_15 <- janjune_15 %>% left_join(zoomed_locs[,c("Group", "LocationID")], by = "LocationID")
+janjune_15 <- janjune_15[,-9]
+```
+
+We have finally reached the point where I can make use of the `taxi_coords` data I created at the beginning. The centroids I created will be used for clustering algorithms. Since this data doesn't provide exact values, I figured the best estimate I could come up with would be the centroids of each respective location (though this is probably inaccurate for the airports; fortunately, they're already rather far from the rest of the data).
+
+I used a sample of 1.3 million rows of the data (out of 12 million), because using more than that would crash my RStudio. I think it's a large enough sample that it can be considered representative of the population.
+
+```{r, echo=FALSE}
+# Adding the centroid coordinates to the dataframe
+set.seed(7475)
+prelim <- sample(12068964, 1300000)
+jj15_s <- janjune_15[prelim,]
+jj15_s <- jj15_s %>% left_join(taxi_coords[,c("lon", "lat", "LocationID")], by = "LocationID")
+```
+
+## K-means Clustering
+
+We can see here precisely my concern with using clustering algorithms on this data. At 3, 4, and 5 centers, the k-means clustering makes a cluster that overlaps locations in Manhattan with those in Brooklyn and Queens. While this may have been the correct way for the algorithm to group the data, I still do not believe that it represents a truly "ideal" setup for a prospective driver.
+
+However, I think there may be value in dividing the Manhattan area in half, so that is worth considering. 
+
+Also, I was unable to plot the clusters on the map because I would get the following error: `vector memory exhausted (limit reached?)`
+I would need a substantially smaller sample to make it work, unfortunately. However, I probably could have only used the unique values, since there aren't that many.
+
+```{r, echo=FALSE}
+set.seed(1729)
+jj15_samplecoords <- jj15_s[,c("lon", "lat")]
+
+ggplot(data = jj15_samplecoords, mapping = aes(x = lon, y = lat)) +
+  geom_point()
+
+MS.km <- c()
+km.out <- c()
+km.data <- jj15_samplecoords
+for(i in 1:7) {
+  km.out <- kmeans(jj15_samplecoords, centers = i, nstart = 20)
+  MS.km[i] <- km.out$tot.withinss
+}
+plot(x = c(1:7), y = MS.km, xlab = "Number of Centers", ylab = "tot.withinss")
+
+km.out3 <- kmeans(jj15_samplecoords, centers = 3, nstart = 20)
+km.data$cl3 <- as.factor(km.out3$cluster)
+km.out4 <- kmeans(jj15_samplecoords, centers = 4, nstart = 20)
+km.data$cl4 <- as.factor(km.out4$cluster)
+km.out5 <- kmeans(jj15_samplecoords, centers = 5, nstart = 20)
+km.data$cl5 <- as.factor(km.out5$cluster)
+
+ggplot(data = km.data, mapping = aes(x = lon, y = lat)) +
+  geom_point(aes(color = cl3), size = 3) +
+  ggtitle("K-Means Clustering Results with K = 3")
+
+ggplot(data = km.data, mapping = aes(x = lon, y = lat)) +
+  geom_point(aes(color = cl4), size = 3) +
+  ggtitle("K-Means Clustering Results with K = 4")
+
+ggplot(data = km.data, mapping = aes(x = lon, y = lat)) +
+  geom_point(aes(color = cl5), size = 3) +
+  ggtitle("K-Means Clustering Results with K = 5")
+```
+
+## Hierarchical Clustering
+
+The hierarchical clusters came up with clusters that very closely match my hypothesized groups They suggest adding an extra location to the `lga` group, but I think this is suboptimal, as airports on their own are high-traffic enough to be worth being a driver's sole focus. Furthermore, trips taken from airports are likely to travel greater distances, so a driver picking someone up from the airport is likely to find themselves displaced rather significantly, meaning that they probably wouldn't end up being close to this other proposed location anyway (however, I acknowledge that this could work the other way around with JFK; drivers picking people up from there may end up being close to - or even in - another one of the clusters). 
+
+```{r, echo=FALSE}
+set.seed(4444)
+# Hierarchical clustering of the data
+hc.sample <- sample(1300000, 1000)
+jj15_hc <- jj15_samplecoords[hc.sample,]
+
+data.tb <- as_tibble(jj15_hc)
+
+hc.avg <- hclust(d = dist(data.tb), method = "average")
+ggdendrogram(data = hc.avg)
+hc.av <- cutree(tree = hc.avg, h = .05)
+data.hc_avg <- add_column(data.tb, hc.avg = as.factor(hc.av))
+ggplot(data = data.hc_avg, mapping = aes(x = lon, y = lat)) +
+  geom_point(aes(color = hc.avg)) +
+  labs(title = "Hierarchical Clustering with Euclidean Distance")
+
+hc.avg.manhattan <- hclust(d = dist(data.tb, method = "manhattan"), method = "average")
+ggdendrogram(data = hc.avg.manhattan)
+hc.av.m <- cutree(tree = hc.avg, h = .05)
+data.hc.avg.manhattan <- add_column(data.tb, hc.avg = as.factor(hc.av.m))
+ggplot(data = data.hc.avg.manhattan, mapping = aes(x = lon, y = lat)) +
+  geom_point(aes(color = hc.avg)) +
+  labs(title = "Hierarchical Clustering with Manhattan Distance")
+
+hc.st.m <- st_as_sf(data.hc.avg.manhattan, coords = c("lon", "lat"), crs = 4326)
+hc.st.m <- st_transform(hc.st.m, crs = 2163)
+
+hc.st <- st_as_sf(data.hc_avg, coords = c("lon", "lat"), crs = 4326)
+hc.st <- st_transform(hc.st, crs = 2163)
+ggplot() + 
+  geom_sf(data = hc.st, aes(color = hc.avg)) +
+  geom_sf(data = relevant_locs, alpha = .05, col = "grey10", size = .1) +
+  coord_sf() +
+  theme(axis.text.x=element_text(angle=25,hjust=1)) +
+  theme(panel.background = element_rect(fill = "ghostwhite")) +
+  theme(panel.grid.major = element_blank()) +
+  labs(title = "Clusters Visualized (Euclidean)")
+
+ggplot() + 
+  geom_sf(data = hc.st.m, aes(color = hc.avg)) +
+  geom_sf(data = relevant_locs, alpha = .05, col = "grey10", size = .1) +
+  coord_sf() +
+  theme(axis.text.x=element_text(angle=25,hjust=1)) +
+  theme(panel.background = element_rect(fill = "ghostwhite")) +
+  theme(panel.grid.major = element_blank()) +
+  labs(title = "Clusters Visualized (Manhattan)")
+```
+
+## Analysis with Groups
+
+I chose to stick with my originally hypothesized groups, for the reasons I stated in the previous two sections. It may have been worth dividing my `manhattan` group, as the k-means clustering did, so perhaps that would be something to investigate in the future. However, I am now interested in examining and testing the strength of my new `Group` variable.
+
+This grid sadly didn't tell me much, other than that the proportion of activity across all groups appears rather consistent throughout the day, which is something I will investigate later on.
+
+```{r, echo=FALSE}
+tot <- ggplot(data = zoomed_locs, aes(x = Group, y = n)) +
+  geom_point() +
+  labs(title = "Total Rides by Group")
+
+morn <- ggplot(data = zoomed_locs, aes(x = Group, y = morn)) +
+  geom_point() +
+  labs(title = "Morning Rides by Group")
+
+noon <- ggplot(data = zoomed_locs, aes(x = Group, y = noon)) +
+  geom_point() +
+  labs(title = "Midday Rides by Group")
+
+night <- ggplot(data = zoomed_locs, aes(x = Group, y = night)) +
+  geom_point() + 
+  labs(title = "Nighttime Rides by Group")
+
+grid.arrange(tot, morn, noon, night, ncol = 2)
+```
+
+
+Look at those $R^2$ values! Once again, despite no day of the week being statistically significant, including them in the model improves the $R^2$ value (though this time it's only the adjusted $R^2$ that gets better). I notice that the `manhattan` group stands out a lot. This makes sense, as it's the largest, and contains 14/15 of the highest-volume locations. I wonder how these models would look if I normalized the data a bit.
+
+Also, adding an interaction between `Group` and `period` while including `weekday` yields an extremely high adjusted $R^2$ of over .94! This may be our model!
+
+```{r, echo=FALSE}
+head(janjune_15)
+jj15_pergrp <- janjune_15 %>% count(period, Group)
+lm.grp <- lm(n ~ ., data = jj15_pergrp)
+
+jj15_wkdgrp <- janjune_15 %>% count(period, Group, weekdays)
+lm.wkdgrp <- lm(n ~ ., data = jj15_wkdgrp)
+lm.wkdgrpm <- lm(n ~ Group*period + weekdays, data = jj15_wkdgrp)
+lm.wkdgrpm2 <- lm(n ~ Group*period + weekdays, data = jj15_wkdgrp)
+
+summary(lm.grp)
+summary(lm.wkdgrp)
+summary(lm.wkdgrpm2)
+```
+
+Ok, so I learned something: using proportions for a regression model is a bad idea, because of perfect multicollinearity. Perhaps I should have known this would happen. Regardless, I still have to plot the above models.
+
+```{r, echo=FALSE}
+group_props <- zoomed_locs %>% group_by(Group) %>% 
+  summarise_at(vars(morn, noon, night, n), list(tot = sum))
+group_tots <- zoomed_locs %>% count(Group)
+group_tots <- as.data.frame(group_tots)
+group_props <- group_props %>% left_join(group_tots[,c("Group", "n")], by = "Group")
+group_props <- group_props %>% mutate(morn_prop = morn_tot/n_tot,
+                                      noon_prop = noon_tot/n_tot,
+                                      night_prop = night_tot/n_tot)
+
+jj15_pergrp.prop <- jj15_pergrp %>% left_join(group_props, by = "Group")
+jj15_pergrp.prop <- jj15_pergrp.prop[,-c(3:6, 8:9)]
+
+lm.grp.prop <- lm(n_tot ~ ., data = jj15_pergrp.prop)
+summary(lm.grp.prop)
+```
+
+
+Unfortunately, I was unable to figure out how to plot the model factoring in `weekdays` without making 7 unreadable plots on a grid. However, it is still evident that this model fits the data quite well.
+
+```{r, echo=FALSE}
+lm.wkdgrpm %>% plot_model(type = "pred", terms = c("Group", "period"), show.data = TRUE) + geom_line()
+
+lm.wkdgrpm2 %>% plot_model(type = "pred", terms = c("Group", "period"), show.data = TRUE) + geom_line()
+
+lm.wkdgrpm2 %>% plot_model(type = "pred", terms = c("Group", "period", "weekdays"), show.data = TRUE) + geom_line()
+```
+
+While not particularly enlightening, this plot further illuminates the gap between Uber activity later in the day compared to in the morning.
+
+```{r, echo=FALSE}
+ggplot(data = group_props) +
+  geom_point(aes(x = Group, y = morn_prop, col = "Morning", pch = "Morning"), size = 4.5) +
+  geom_point(aes(x = Group, y = noon_prop, col = "Afternoon", pch = "Afternoon"), size = 4.5) +
+  geom_point(aes(x = Group, y = night_prop, col = "Night", pch = "Night"), size = 4.5) +
+  labs(y = "n", color = "Legend") +
+  scale_color_manual(name = "Legend", breaks = c("Morning", "Afternoon", "Night"), values = c("Morning" = "red", "Afternoon" = "blue", "Night" = "green4")) +
+  scale_shape_manual(name = "Legend", breaks = c("Morning", "Afternoon", "Night"), values = c("Morning" = 16, "Afternoon" = 15, "Night" = 17)) +
+  labs(title = "Proportion of Activity Across Groups by Period")
+```
+
+Two plots: one demonstrating the vast gap between activity in Manhattan compared to everywhere else, and one displaying the extremely strong correlation between time of day and activity by group.
+
+```{r, echo=FALSE}
+jj15_hr <- group_by(janjune_15, hour, Group) %>%
+  count(hour, Group)
+jj15_hr <- as.data.frame(jj15_hr)
+hr_props <- jj15_hr %>% summarise_at(vars(hour, n), list(tot = sum))
+
+grp_hr <- as.data.frame(jj15_hr)
+grp_hr <- melt(grp_hr, id.vars = c("hour", "Group", "n"))
+
+grp_tot <- janjune_15 %>% group_by(Group) %>% count(Group)
+jj15_hr_props <- jj15_hr %>% left_join(grp_tot, by = "Group")
+jj15_hr_props <- jj15_hr_props %>% mutate(hr_prop = n.x/n.y)
+jj15_hr_props <- as.data.frame(jj15_hr_props)
+grp_hr_prop <- melt(jj15_hr_props, id.vars = c("hour", "Group", "hr_prop"))
+
+ggplot(grp_hr, aes(hour, n, col = Group)) +
+  geom_line() +
+  geom_smooth(se = F, col = "black", size = 1.5, lty = 2) + 
+  geom_vline(xintercept = 2, alpha = .5) + 
+  geom_vline(xintercept = 11, alpha = .5) +
+  geom_vline(xintercept = 19, alpha = .5) +
+  scale_x_continuous(breaks = seq(min(weekday_hr$hour), max(grp_hr$hour), 2)) +
+  labs(title = "Activity by Group by Hour")
+
+ggplot(grp_hr_prop, aes(hour, hr_prop, col = Group)) +
+  geom_line() +
+  geom_smooth(se = F, col = "black", size = 1.5, lty = 2) + 
+  geom_smooth(se = F, col = "black", size = .5, lty = 4, method = "lm") + 
+  scale_x_continuous(breaks = seq(min(weekday_hr$hour), max(grp_hr$hour), 2)) +
+  geom_vline(xintercept = 2, alpha = .5) + 
+  geom_vline(xintercept = 11, alpha = .5) +
+  geom_vline(xintercept = 19, alpha = .5) +
+  labs(title = "Proportion of Activity by Group by Hour")
+```
+
+## Conclusions/Thoughts
+
+Based on our analysis of the data, we have concluded that an aspiring Uber driver in NYC should try to work primarily in Manhattan (particularly the southwestern area) in the late afternoon and at night. While this was a fairly trivial conclusion to arrive at with the data we have, it may not be at all correct. To name a couple of reasons why:
+
+1. This dataset was lacking in comprehensive information on the number of active drivers over the course of the day, so we can't know how much 'competition' there was for a given ride.
+
+2. There was no information on the cost nor the duration of the rides. Given that NYC is notorious for its traffic, it's likely that some of the rides, especially in the Manhattan area, were over very short distances, and took disproportionately long. In my experience, long-distance Uber rides cost a lot more than short ones. While I'm sure there is something in place to correct for exceptionally high-traffic areas, if the same is true for NYC, then perhaps it wouldn't be best to base oneself in Manhattan. It would probably be better to operate near one of the airports, since rides from an airport are likely to be going much farther away than rides within the city. 
+
+3. However, even the above could be flawed, since someone could pick someone up from an airport and then end up somewhere with no customers, and thus be forced to waste time and gas driving back to a high-density area. That is to say, there is no data on drop-off locations either. And even with that data, it's entirely possible that we wouldn't be able to make an unequivocally correct model. 
+
+
+## Shortcomings
+
+While this was a pretty exhaustive analysis, there is still so much more that we could have done. For instance, while trying to find evidence to support my earlier assertion about Uber's growth in 2015, I discovered that, in NYC, taxis were still more widely used than Uber at this time. It could be interesting to figure out where the greatest competition between the two was, and if there were any places (or times of day) that had higher ratios of Ubers taken vs. taxis. 
+
+I think an obvious area of improvement would be the selection of my `period` variable. For a truly comprehensive experiment, I perhaps could have investigated a way to run my experiments/aggregations with all 8 sets of possible periods, and maybe even to try different intervals. Uber drivers aren't forced to work full-time, and many of them only do it to supplement their full-time jobs. Perhaps trying intervals of 2-4 hours would have yielded different results. 
+
+It also could have been wise to conduct many of my later tests with some of the ideas that came from the clustering algorithms. In particular, the k-means clusters that divided Manhattan in half seemed strong to me. However, I believe that the limitations of my laptop may have gotten in the way at some point.
+
+Another thing I wish I had been able to do was successfully implement some of the other learning/selection methods. Perhaps I would have been able to find a superior model this way.
+
+
+**Extra/Unused Code**
+
+This was a failed attempt at trying polynomial regression and using `glm`. The two subsequent chunks contain random code from ideas that I never implemented or found use for (or simply things I did that turned out to be inefficient).
+```{r, eval=FALSE, echo=FALSE}
+set.seed(1729)
+jj15_hr <- as.data.frame(jj15_hr)
+
+d <- 4
+MSE.cv.4 <- rep(0,d)
+
+for(i in 1:d) {
+  glm.fit <- glm(n ~ poly(hour, i), data = jj15_hr)
+  MSE.cv.4[i] <- cv.glm(jj15_hr, glm.fit, K = 4)$delta[1]
+}
+
+MSE.cv.4
+
+train.zoom <- sample(1560, 780)
+
+train <- jj_15_hrloc[train.zoom,]
+test <- jj_15_hrloc[-train.zoom,]
+
+lm.train <- lm(n ~ locationID, data = train)
+
+lm.poly5.train <- lm(n ~ poly(hour, 5), data = train)
+
+mean((train$n - predict(lm.train)))
+mean((test$n - predict(lm.train, newdata = test))^2)
+mean((train$n - predict(lm.poly2.train)))
+mean((test$n - predict(lm.poly5.train, newdata = test))^2)
+```
+
+```{r, eval=FALSE, echo=FALSE}
+jj15_loc <- ungroup(jj15_master)
+jj15_loc <- group_by(jj15_loc, LocationID, lon, lat)
+jj15_loc <- aggregate(jj15_loc$n, by = list(jj15_loc$LocationID, jj15_loc$lon, jj15_loc$lat), FUN = sum)
+
+data <- data.frame(jj15_loc$Group.1, jj15_loc$Group.2, jj15_loc$Group.3, jj15_loc$x)
+data <- data %>% dplyr::rename(lon = jj15_loc.Group.2) %>%
+  dplyr::rename(lat = jj15_loc.Group.3) %>%
+  dplyr::rename(LocationID = jj15_loc.Group.1) %>%
+  dplyr::rename(n = jj15_loc.x)
+
+
+jj_15_locgrp <- janjune_15 %>% group_by(locationID, period) %>%
+  count(period) %>%
+  filter(locationID %in% zoomed_locs$LocationID)
+jfk <- jj_15_locgrp %>% filter(locationID == 132)
+jfk <- ungroup(jfk)
+jfk <- aggregate(jfk$n, by = list(jfk$period), FUN = sum)
+jfk <- jfk %>% dplyr::rename(Period = Group.1)
+
+east <- jj_15_locgrp %>% filter(locationID %in% c(61, 80, 112, 181, 252, 255, 256))
+east <- ungroup(east)
+east <- aggregate(east$n, by = list(east$period), FUN = sum)
+east <- east %>% dplyr::rename(Period = Group.1)
+
+manhattan <- jj_15_locgrp %>% filter(locationID %!in% c(61, 80, 112, 181, 252, 255, 256, 132))
+manhattan <- ungroup(manhattan)
+manhattan <- aggregate(manhattan$n, by = list(manhattan$period), FUN = sum)
+manhattan <- manhattan %>% dplyr::rename(Period = Group.1)
+
+loc_groups <- data.frame(jfk, east, manhattan)
+loc_groups
+
+
+janfeb_totals <- janfeb_totals %>% 
+  mutate_at(vars(date), funs(year, month, day, weekdays)) %>%
+  mutate(trips_per_vehicle = (janfeb_totals$trips/janfeb_totals$active_vehicles))
+janfeb_15 <- janjune_15[which(janjune_15$month == 1 | janjune_15$month == 2),]
+
+perloc <- data.frame(jj_15_mornloc, jj_15_noonloc, jj_15_nightloc)
+perloc <- subset(perloc, select = -c(3, 5))
+perloc <- perloc %>% dplyr::rename(Morning = x) %>% 
+  dplyr::rename(Afternoon = x.1) %>%
+  dplyr::rename(Night = x.2) %>%
+  mutate(Total = Morning + Afternoon + Night)
+```
+
+```{r, eval=FALSE, echo = FALSE}
+jj15_master <- group_by(janjune_15, LocationID, weekdays, hour, period) %>% count(LocationID, weekdays, hour) %>%
+  filter(LocationID %in% zoomed_locs$LocationID)
+
+jj15_master <- jj15_master %>% left_join(zoomed_locs[, c("lon", "lat", "LocationID", "Group")], by = "LocationID")
+jj15_master
+jj15_master <- jj15_master[,-9]
+
+janfeb_totals <- read.csv("/Users/john/Desktop/archive-2 2/Uber-Jan-Feb-FOIL.csv")
+janfeb_totals$date <- as.Date(janfeb_totals$date, "%m/%d/%Y")
+
+
+holidays <- janjune_15[which(
+  (janjune_15$month == 1 & janjune_15$day == 1) | 
+  (janjune_15$month == 1 & janjune_15$day == 19) |
+  (janjune_15$month == 2 & janjune_15$day == 1) |
+  (janjune_15$month == 2 & janjune_15$day == 14) |
+  (janjune_15$month == 3 & janjune_15$day == 17) |
+  (janjune_15$month == 4 & janjune_15$day == 5) |
+  (janjune_15$month == 5 & janjune_15$day == 5) |
+  (janjune_15$month == 5 & janjune_15$day == 25)),]
+
+
+g1 <- ggplot(aprsep_zoomed[which(aprsep_zoomed$weekdays == "Sunday"),]) +
+  geom_map(data = states_map, map = states_map,
+           aes(map_id = region), fill = "white", color="black") + 
+  xlim(min(aprsep_zoomed$Lon), max(aprsep_zoomed$Lon)) +
+  ylim(min(aprsep_zoomed$Lat), max(aprsep_zoomed$Lat)) +
+  geom_point(aes(x = Lon, y = Lat, col = hour), size = .3) +
+  coord_quickmap() + 
+  guides(fill = "none")
+
+g2 <- ggplot(aprsep_zoomed[which(aprsep_zoomed$weekdays == "Monday"),]) +
+  geom_map(data = states_map, map = states_map,
+           aes(map_id = region), fill = "white", color="black") + 
+  xlim(min(aprsep_zoomed$Lon), max(aprsep_zoomed$Lon)) +
+  ylim(min(aprsep_zoomed$Lat), max(aprsep_zoomed$Lat)) +
+  geom_point(aes(x = Lon, y = Lat, col = hour), size = .3) +
+  coord_quickmap() + 
+  guides(fill = "none")
+
+g3 <- ggplot(aprsep_zoomed[which(aprsep_zoomed$weekdays == "Tuesday"),]) +
+  geom_map(data = states_map, map = states_map,
+           aes(map_id = region), fill = "white", color="black") + 
+  xlim(min(aprsep_zoomed$Lon), max(aprsep_zoomed$Lon)) +
+  ylim(min(aprsep_zoomed$Lat), max(aprsep_zoomed$Lat)) +
+  geom_point(aes(x = Lon, y = Lat, col = hour), size = .3) +
+  coord_quickmap() + 
+  guides(fill = "none")
+
+g4 <- ggplot(aprsep_zoomed[which(aprsep_zoomed$weekdays == "Saturday"),]) +
+  geom_map(data = states_map, map = states_map,
+           aes(map_id = region), fill = "white", color="black") + 
+  xlim(min(aprsep_zoomed$Lon), max(aprsep_zoomed$Lon)) +
+  ylim(min(aprsep_zoomed$Lat), max(aprsep_zoomed$Lat)) +
+  geom_point(aes(x = Lon, y = Lat, col = hour), size = .3) +
+  coord_quickmap() + 
+  guides(fill = "none")
+
+grid.arrange(g1, g2, g3, g4, ncol=2)
+
+apr <- read.csv("/Users/john/Desktop/archive-2 2/uber-raw-data-apr14.csv")
+may <- read.csv("/Users/john/Desktop/archive-2 2/uber-raw-data-may14.csv")
+jun <- read.csv("/Users/john/Desktop/archive-2 2/uber-raw-data-jun14.csv")
+jul <- read.csv("/Users/john/Desktop/archive-2 2/uber-raw-data-jul14.csv")
+aug <- read.csv("/Users/john/Desktop/archive-2 2/uber-raw-data-aug14.csv")
+sep <- read.csv("/Users/john/Desktop/archive-2 2/uber-raw-data-sep14.csv")
+aprsep_14 <- rbind(apr, may, jun, jul, aug, sep)
+
+#2014 converting date/time
+aprsep_14$Date.Time <- mdy_hms(aprsep_14$Date.Time)
+aprsep_14 <- aprsep_14 %>% 
+  mutate_at(vars(Date.Time), funs(year, month, day, weekdays)) %>%
+  mutate(time = format(Date.Time, "%H:%M"),
+         hour = hour(Date.Time))
+
+lonsd <- sd(aprsep_14$Lon)
+latsd <- sd(aprsep_14$Lat)
+aprsep_zoomed <- aprsep_14[which(
+  (abs(aprsep_14$Lat - mean(aprsep_14$Lat)) < 11*latsd) & 
+  (aprsep_14$Lon < -72.9 & aprsep_14$Lon > - 74.75)),]
+
+wkd <- c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+
+states_map <- map_data("state")
+ggplot(aprsep_zoomed) +
+  geom_map(data = states_map, map = states_map,
+           aes(map_id = region), fill = "white", color="black") + 
+  xlim(min(aprsep_zoomed$Lon), max(aprsep_zoomed$Lon)) +
+  ylim(min(aprsep_zoomed$Lat), max(aprsep_zoomed$Lat)) +
+  geom_point(aes(x = Lon, y = Lat, col = hour), size = .4) +
+  coord_quickmap() + 
+  guides(fill = "none")
+
+janfeb_15_base <- filter(janfeb_15, !(Affiliated_base_num == ""))
+head(janfeb_15_base)
+
+janfeb_bybase <- group_by(janfeb_totals, dispatching_base_number, weekdays)
+
+janfeb_bybase <- as.data.frame(janfeb_bybase) 
+jf_byday <- melt(janfeb_bybase, id.vars = c("weekdays", "dispatching_base_number", "trips_per_vehicle"))
+
+ggplot(weekday_hr, mapping = aes(weekdays, hour, fill = n)) +
+         geom_tile(color = "white")
+```

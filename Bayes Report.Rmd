@@ -1,0 +1,197 @@
+---
+title: "Bayes' Rule and Monty Hall"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+---
+
+# Introduction: Bayes
+
+Bayes' rule is a pivotal result in probability that is taught in any introductory-level course. It can be stated as "The probability of an event $A$ happening, given that event $B$ has happened, is equal to: The probability of event $B$ given event $A$ times the probability of event $A$, all divided by the probability of event $B$. In mathematical notation, it is expressed as follows (at least in discrete cases):
+
+$$P(A \mid B) = \frac{P(B \mid A) \cdot P(A)}{P(B)}$$
+A more complete statement of the rule would be:
+$$P(A \mid B) = \frac{P(B \mid A)\cdot P(A)}{P(B \mid A) \cdot P(A) + P(B \mid A^c) \cdot P(A^c)}$$
+Where $A^c$ represents the complement of $A$, or the probability of all events in the sample space other than $A$ (that is, $P(A^c) = 1 - P(A)$. It is trivial to prove that this new denominator is equal to the old one (this is actually known as the Law of Total Probability):
+
+$$P(B) = P(B \mid A) \cdot P(A) + P(B \mid A^c) \cdot P(A^c) $$
+Using Bayes' rule:
+$$P(B) = \frac{P(A \mid B) \cdot P(B)}{P(A)} \cdot P(A) + \frac{P(A^c \mid B) \cdot P(B)}{P(A^c)} \cdot P(A^c) $$
+$$
+P(B) = P(A \mid B) \cdot P(B) + P(A^c \mid B) \cdot P(B)$$
+$$P(B) = P(B)\cdot(P(A \mid B) + P(A^c \mid B))$$
+$$P(A \mid B) + P(A^c \mid B) = 1$$
+$$P(B) = P(B)$$
+This rule was first derived by Thomas Bayes, a British Presbyterian minister and statistician who lived in the early to mid-1700s. It has many useful, and obvious, applications. For example:
+
+
+
+1% of people have a genetic defect. 95% of tests for this defect correctly detect it. 8.5% of tests, however, yield false positives. If a person tests positive for this defect, what is the probability that they actually have it? Let's say that the event event $A$ represents having the genetic defect, and event $B$ represents a positive test. Then we have:
+
+$$P(A \mid B) = \frac{P(B \mid A)\cdot P(A)}{P(B \mid A) \cdot P(A) + P(B \mid A^c) \cdot P(A^c)}$$
+Note that $$P(B \mid A)$$ is equivalent to the true positive defined in the problem (the chance that the test will correctly identify the defect) and $$P(B \mid A^c)$$ is equivalent to the chance of a false positive, so we can substitute in $.95$ and $.085$ for these, respectively. Substituting these, along with the probabilities of events $A$ and $B$, we get:
+
+$$P(A \mid B) = \frac{.95 \cdot .01}{{.95 \cdot .01 + .085 \cdot .99}}$$
+
+From here it's a matter of simple arithmetic to arrive at our solution:
+
+$$P(A \mid B) = \frac{.0095}{{.0095 + .08415}} = .1014$$
+
+So there is a 10.14% chance of someone who tests positive having this genetic defect.
+
+This is a very practical and obvious application of Bayes' rule. However, we are going to examine a famously unintuitive problem that Bayes' rule can be used to solve.
+
+***
+
+# Introducing and Demonstrating Monty Hall (Empirical Proof)
+
+The Monty Hall problem is a notorious probability puzzle, which is stated as follows (quote taken from a letter submitted by Craig F. Whitaker to _Parade_ magazine in 1990): 
+
+"Suppose you're on a game show, and you're given the choice of three doors: Behind one door is a car; behind the others, goats. You pick a door, say No. 1, and the host, who knows what's behind the doors, opens another door, say No. 3, which has a goat. He then says to you, "Do you want to pick door No. 2?" 
+**Is it to your advantage to switch your choice?"**
+
+The intuitive approach to this problem would be to answer "no." Knowing that there was a goat behind another door only tells the contestant that they have a 50% chance of having chosen the correct door from the beginning, and that switching their choice would be equivalent to flipping a coin.
+
+However, we can prove this intuition to be incorrect by constructing a simulation (or rather, several thousand simulations). The following R code randomly constructs a vector composed of two zeroes (to represent the two goat doors) and a 1 (the car door).
+
+```{r}
+set.seed(1729)
+mh.vals = c(1, 0, 0)
+mh.data = function() {
+  return(sample(mh.vals))
+}
+replicate(10, mh.data()) # To demonstrate that a random door is the 'correct' one each time
+```
+
+Now we can create a function that takes in a vector containing the two unopened doors (we will remove the one that was chosen). If the contestant initially chose the `car` door, then this function will return `0`, as the host will open one of the two `goat` doors, leaving only the other `goat` door as the option for the contestant to switch to. However, if the contestant chose one of the `goat` doors, then the function will return `1`. This is because the host will open the remaining `goat` door, and the `car` door will be left as the contestant's option to switch to.
+
+```{r}
+mh.rem2 = function(vec) {
+  if (vec[1] == vec[2]) {
+    return(0)
+  }
+  else {
+    return(1)
+  }
+}
+```
+
+This function takes in the value of the initial choice, as well as the value behind the remaining door after the goat has been revealed (the output of the above function). Since one of the goat doors will have been opened, there is only one door to choose. The third input is the strategy the player chooses to employ (either `stay` with their initial choice or `switch` to the other unopened door). So if we are staying, the function returns our initial choice, and if we choose to switch, it returns the other door.
+
+```{r}
+mh.choosing = function(initial_choice, other_door, strategy) {
+  if(strategy == "stay") {
+    return(initial_choice)
+  }
+  else if (strategy == "switch") {
+    return(other_door)
+  }
+}
+```
+
+
+Now it's time to play the game!
+
+Used this way (with a length value), `sample` chooses a single index of our vector at random. I liked this better than simply having the contestant choose a fixed door every single time. Moreover, using `seq_along` for the sampling (which is what makes it choose an index instead of a value) and then assigning the chosen index to another variable allows us to remove the value at our index from the vector, so that the two remaining values can be used for the `mh.rem2` function.
+
+```{r}
+montyhall.game = function(strat_choice){
+  doors = mh.data()
+  chosen = sample(seq_along(doors), 1)
+  c = doors[chosen]
+  doorsleft = doors[-chosen]
+  return(mh.choosing(c, mh.rem2(doorsleft), strat_choice))
+}
+```
+
+Let's run some simulations!
+
+```{r}
+set.seed(7252)
+# simulates 100 iteratioons of the experiment with the provided strategy
+switch.sim = c(replicate(100, montyhall.game("switch"))) 
+stay.sim = c(replicate(100, montyhall.game("stay")))
+
+switch.sim
+stay.sim
+sum(switch.sim) # since goats are 0, this will count the number of cars won over 100 trials
+sum(stay.sim)
+```
+
+Now, to get a cleaner look at the results.
+
+```{r}
+switch.tab = table(switch.sim)
+stay.tab = table(stay.sim)
+dn = dimnames = list(c("Goat", "Car"), c("Switch", "Stay"))
+res_mat = matrix(cbind(switch.tab, stay.tab), 2, 2, dimnames = dn)
+res_mat[nrow(res_mat):1, ]
+```
+
+For a more conclusive visualization, I'll run the 100 simulated experiments for each strategy 1000 times, and then plot the results on a frequency histogram. I'll even add a new strategy that chooses randomly between switching and staying.
+
+```{r}
+library(ggplot2)
+set.seed(7252)
+randvec = c("switch", "stay")
+randmeans = c(replicate(1000, mean(replicate(100, montyhall.game(sample(randvec, 1))))))
+switchmeans = c(replicate(1000, mean(replicate(100, montyhall.game("switch")))))
+staymeans = c(replicate(1000, mean(replicate(100, montyhall.game("stay")))))
+mh_means = data.frame(switchmeans, staymeans, colnames = c("mean"))
+
+
+ggplot(mh_means, aes(x = c(.25, .75))) + 
+  scale_color_manual(name = "", values = c(Stay = "blue", Random = "darkgreen", Switch = "red")) +
+  scale_fill_manual(name = "", values = c(Stay = "lightsteelblue1", Random = "lightgreen", Switch = "#ff7b7b")) +
+  geom_histogram(alpha = .8, aes(staymeans, fill = "Stay", col = "Stay"), bins = 30) +
+  geom_histogram(alpha = .8, aes(switchmeans, fill = "Switch", col = "Switch"), bins = 30) + 
+  geom_histogram(alpha = .4, aes(randmeans, fill = "Random", col = "Random"), bins = 30) +
+  scale_x_continuous(breaks = round(seq(min(staymeans), max(switchmeans), by = 0.05),1)) +
+  geom_vline(xintercept = 1/3, alpha = .8, lty = 3) +
+  geom_vline(xintercept = 2/3, alpha = .8, lty = 3) + 
+  geom_vline(xintercept = 1/2, alpha = .8, lty = 3) +
+  labs(x = "Mean", y = "Frequency", title = "Mean Success Probability of 1000 Simulations of 100 Monty Hall Trials") + 
+  guides(color = guide_legend(override_aes = list(size = 3)))
+```
+
+***
+
+# Verifying our Results (Mathematical Proof)
+
+It is quite evident, empirically, that switching doors is the best strategy for anyone who wants a car, with a mean success rate of 2/3 compared to staying (1/3) or choosing randomly (1/2). 
+
+But...how? Let us now attempt to prove this mathematically, using Bayes' rule.
+
+We shall define our two possible outcomes (for each door) as $Car$ and $Goat$, and our three doors as $X$, $Y$, and $Z$. Then our sample space for this experiment is: 
+
+$$\begin{aligned}
+\Omega = \{(X = \text{Goat and is selected, } Y = \text{Goat and is opened, } Z = \text{Car and is switched to}),\\  (X = \text{Car and is not switched to, } Y = \text{Goat and is selected, } Z = \text{Goat and is opened}), \\
+(X = \text{Goat and is opened, } Y = \text{Goat and is not switched to, } Z = \text{Car and is selected}),...\} \\
+\end{aligned}$$
+Assume all doors have an equal chance of being selected. It is then trivial to conclude that, for our initial choice:
+
+$$P(\text{Car}) = \frac13 \text{ and } P(\text{Goat}) = \frac23$$
+
+However, once it comes time for a goat door to be revealed to us, the scenario changes. We now need to update our probabilities.
+
+Assume we choose door $X$. We know that 
+$$P(X = \text{Car}) = \frac13 \text{ and } P(X = \text{Goat}) = \frac23$$
+And we also know that the host will only open a door that has a goat behind it. Let's assume that Door $Y$ has a goat behind it, and is the door the host will open if we choose $X$ or $Z$ (which are both unknown). Then, using Bayes' rule:
+
+$$P(X = \text{Car} \mid \text{Opens } Y) = \frac{P(\text{Opens } Y \mid X = \text{Car})\cdot P(X = \text{Car})}{P(\text{Opens } Y \mid X = \text{Car}) \cdot P(X = \text{Car}) + P(\text{Opens } Y \mid X \neq \text{Car}) \cdot P(X \neq \text{Car})}$$
+$$P(X = \text{Car} \mid \text{Opens } Y) = \frac{1\cdot \frac13}{1\cdot \frac13 + 1\cdot \frac23} \\
+= \frac{\frac13}{1} = \frac13$$
+
+Monty has chosen to open $Y$, and we have just proven that we have a 1/3 chance of winning a car after choosing $X$ - even given that $Y$ has been opened.
+
+We know that there is a car behind one of the three doors, so summing the probabilities of choosing the car across each door will total to 1, since we are guaranteed to get one car if we open all three doors. We now know the probabilities of getting a car for $X$ and $Y$, so all we have to do is:
+
+$$P(X = \text{Car}) + P(Y = \text{Car}) + P(Z = \text{Car}) = 1$$
+$$\frac13 + 0 + P(Z = \text{Car}) = 1$$
+$$P(Z = \text{Car}) = \frac23$$
+
+$$\therefore P(\text{Car} \mid \text{Switch}) = \frac23\text{, } P(\text{Car} \mid \text{Stay}) = \frac13$$
+
+We can conclude that the optimal strategy for a Monty Hall scenario is to switch one's choice. 

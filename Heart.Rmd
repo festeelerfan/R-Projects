@@ -1,0 +1,544 @@
+---
+title: "Framingham Heart Study"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+---
+
+# Introduction and Goals
+
+The Framingham Heart Study dataset (source: `sashelp.heart`) contains information about individuals, and is meant to be used to provide insights on causes and effects of coronary heart disease. It contains the following variables:
+
+`Status`: Binary (Alive or Dead)
+
+`Cause of Death` (renamed to `DeathCause`: Self-explanatory
+
+`Age CHD Diagnosed` (renamed to `CHDAge`): Age of patient when diagnosed with coronary heart disease
+
+`Sex`: Binary (Male or Female)
+
+`Age at Start` (renamed to `StartAge`): Age at time entered into study
+
+`Height`: in inches
+
+`Weight`: in lbs.
+
+`Diastolic`: Diastolic blood pressure
+
+`Systolic`: Systolic blood pressure
+
+`Metropolitan Relative Weight` (renamed to `MRW`): A reference desirable weight based on height
+
+`Smoking`: Number of cigarettes smoked per day
+
+`Age at Death` (renamed to `DeathAge`): Self-explanatory (NA for living patients)
+
+`Cholesterol`: Measured in mg/dL
+
+`Cholesterol Status` (renamed to `CholStatus`): Factor (Desirable, Borderline, or High)
+
+`Blood Pressure Status` (renamed to `BPStatus`): Factor( Optimal, Normal, or High)
+
+`Weight Status` (renamed to `WeightStatus`): Factor (Underweight, Normal, or Overweight)
+
+`Smoking Status` (renamed to `SmokeStatus`): Factor (Non-smoker, Light (1-5), Moderate (6-15), Heavy (16-25), Very Heavy (>25))
+
+As well as one relevant variable that I added:
+`CHDStatus`: Factor (1 for patients who have been diagnosed with coronary heart disease, 0 for patients who have not).
+
+The goal of this project is centered around the `CHDStatus` variable: I am attempting to create a statistical model to predict whether or not someone will be diagnosed with coronary heart disease based on the variables provided in the dataset. 
+
+```{r}
+library(readxl) # to read the dataset
+library(tidyverse) 
+library(caret) # for LASSO regression
+# devtools::install_github("selva86/InformationValue")
+library(InformationValue) # for diagnostics
+library(ROCit) # same as above
+library(modelr)
+library(broom) # for ease of working with model output
+library(glmnet) # for LASSO regression
+library(reshape2) # for visualization
+# library(corrplot)
+# library(glinternet)
+library(car)
+library(GGally) # for ggpairs
+library(rms) # for vif
+heart_orig <- read_xlsx("/Users/john/Desktop/Heart orig.xlsx", col_names = TRUE)
+heart <- read_xlsx("/Users/john/Desktop/Heart copy.xlsx", col_names = TRUE)
+nrow(heart_orig)
+nrow(heart)
+head(heart)
+```
+
+# Cleaning/Modification
+
+The dataset as a whole is quite clean, but there are still several entries with missing values that can't be allowed (obviously NA values are acceptable for `CHDAge`, `DeathAge`, and `DeathCause`). These rows were removed using the Filter tool in Excel, reducing the data from 5209 observations to 5039.
+
+In R, the numeric and factor columns had to be properly designated, and the latter had to be reordered, as many of the factor variables are clearly meant to be ordinal. I also created my `CHDStatus` variable and computed its sum to verify that the sample size was sufficient for testing. It came out to 1404, which gives more than enough people both with and without coronary heart disease to build predictive models.
+
+```{r, Echo=FALSE}
+# Identify numeric and factorial columns, then assign both groups to their identified variable type
+fac_cols <-c("Status", "DeathCause", "Sex", "CholStatus", "BPStatus", "WeightStatus", "SmokeStatus")
+num_cols <- c("CHDAge", "Height", "Weight","MRW", "DeathAge", "Smoking", "Cholesterol")
+heart[fac_cols] <- lapply(heart[fac_cols], factor)
+heart[num_cols] <- lapply(heart[num_cols], as.double)
+
+# Reorder ordinal factor columns
+heart$WeightStatus <- factor(heart$WeightStatus, levels=c("Underweight", "Normal", "Overweight"))
+heart$SmokeStatus <- factor(heart$SmokeStatus, levels=c("Non-smoker", "Light (1-5)", "Moderate (6-15)", "Heavy (16-25)", "Very Heavy (> 25)"))
+heart$CholStatus <- factor(heart$CholStatus, levels=c("Desirable", "Borderline", "High"))
+heart$BPStatus <- factor(heart$BPStatus, levels=c("Optimal", "Normal", "High"))
+
+
+# Create CHDStatus column
+heart$CHDStatus <- ifelse(!is.na(heart$CHDAge), 1, 0)
+heart$CHDStatus <- as.factor(heart$CHDStatus)
+sum(as.numeric(heart$CHDStatus)-1)
+```
+
+# Exploratory Data Analysis
+
+Nothing unusual is unearthed here. Correlations between `Systolic` and `Diastolic` are to be expected, since they are both measures of blood pressure. Note that `Systolic` was chosen for visualization over `Diastolic` because some research revealed that doctors put more importance on systolic blood pressure in patients. Correlation between `MRW` and `Weight` may indicate that MRW doesn't actually do very much to correct for height, but looking at the `Height vs. Weight` and `Height vs. MRW` plots says otherwise. This is important to keep in mind, as it verifies a lack of multicollinearity between predictors, which will be important for our models later (so long as none of the models includes `Diastolic` with `Systolic` or potentially `Weight` with `MRW`). Other than this, the only thing of note is that it doesn't seem like people with coronary heart disease smoke much more than those without. 
+
+```{r}
+# Check for correlation between key numeric variables
+ggpairs(heart[,c("Smoking", "Systolic", "Diastolic", "Height", "Weight", "Cholesterol", "MRW")])
+```
+```{r}
+# Examine relationships between key numeric variables and CHDStatus
+g <- melt(heart[,c("CHDStatus","Smoking", "Systolic", "Cholesterol", "MRW")])
+
+ggplot(g, aes(factor(CHDStatus), y=value, fill = factor(CHDStatus))) + 
+  geom_boxplot() +
+  facet_wrap(~variable, scales="free_y")
+
+# Do the same as above with BPStatus
+h <- melt(heart[,c("BPStatus","Smoking", "Height", "Cholesterol", "MRW")])
+ggplot(h, aes(factor(BPStatus), y=value, fill = factor(BPStatus))) + 
+  geom_boxplot() +
+  facet_wrap(~variable, scales="free_y")
+
+l <- melt(heart[,c("CholStatus","Smoking", "Height", "Systolic", "MRW")])
+ggplot(l, aes(factor(CholStatus), y=value, fill = factor(CholStatus))) + 
+  geom_boxplot() +
+  facet_wrap(~variable, scales="free_y")
+
+# Check distribution of key numeric variables
+i <- melt(heart[,c("StartAge","Smoking", "Systolic", "Cholesterol", "MRW", "Height")])
+ggplot(i, aes(, x=value)) + 
+  geom_histogram(binwidth=5) +
+  facet_wrap(~variable, scales="free")
+```
+
+# First Model: Stepwise
+
+Since the response variable `CHDStatus` is binary, I decided to use logistic regression to model it. So our model will be of the form
+
+$$P(x) = \frac{e^{\beta_0 + \beta_1 x}}{1 + e^{\beta_0 + \beta_1 x_1}}$$
+Where $P(x)$ is the probability of any person $x$ being diagnosed with coronary heart disease, $\beta_0$ is the intercept coefficient and $\beta_1$ a predictor variable (note that we will almost definitely be including more $\beta$ terms in our final model. These are simply additional predictors).
+
+Before building a model, the data needs to be partitioned into training and test sets, and a seed is designated to allow for reproduction of the results.
+
+```{r}
+# set seed for reproducibility and partition data into training and test sets
+set.seed(320)
+heart$id <- 1:nrow(heart)
+train <- heart %>% sample_frac(.8)
+test <- anti_join(heart, train, by='id')
+```
+
+
+To perform stepwise selection, we first create a 'full' model, which contains all variables and all interactions, and a 'null' model, which has only an intercept coefficient of 1. Note that I have excluded `Status`, `DeathAge`, and `CHDAge` from this model, as these variables would not be useful for what I am trying to model (there is no point in predicting whether a dead person, or someone who is already known to have coronary heart disease, will be diagnosed with a coronary heart disease). Also note that I left the factorial counterparts of some numeric variables (for instance, `CholStatus` vs. `Cholesterol`) out of the interaction in the formula for `full.model`. I did this because I had already previously tested, and found that the numeric versions were better to use for prediction. Moreover, keeping both in any given model would lead to significant multicollinearity, which would violate an assumption of logistic regression. And finally, keeping the factorial predictors in the interaction part of the model created a huge runtime problem. Therefore, I chose to exclude them.
+
+```{r}
+# full model with all variables and all numeric interactions
+full.model <- glm(CHDStatus ~ Sex + StartAge + Height + Weight + Diastolic + Systolic + MRW + Smoking + Cholesterol + CholStatus + BPStatus + WeightStatus + SmokeStatus + Sex*StartAge*Height*MRW*Weight*Systolic*Smoking*Cholesterol, na.action = na.omit, family = "binomial", data = train)
+# summary(full.model) 
+# null model to compare stepwise model against
+null.model <- glm(CHDStatus ~ 1, family = "binomial", data=train)
+
+# Optimal model created by stepwise selection
+step.model <- step(null.model, scope = list(upper=full.model), direction="both", text="Chisq", trace=F)
+summary(step.model)
+
+# with(step.model, pchisq(null.deviance - deviance, df.null - df.residual, lower.tail=FALSE))
+# logLik(step.model)
+```
+The stepwise selection process indicates that I should use the following for the model:
+
+$$P(x) = \frac{e^{-6.477114 + .038149x_1 -.015317x_2 +.004748x_3+.009666x_4+.007881x_5+.008255x_6 + .003141x_2 x_3}}{1+e^{-6.477114 + .038149x_1 -.015317x_2 +.004748x_3+.009666x_4+.007881x_5+.008255x_6 + .003141x_2 x_3}}$$
+However, before proceeding, I check the assumptions of logistic regression. First I need a binary response variable, which `CHDStatus` is. Next, no multicollinearity between predictors. This was verified above with `ggpairs`, since `Diastolic` and `Weight` are absent from the model. But it can be further checked with the `vif` function, which shows high VIF for `SexMale` and `SexMale:Cholesterol`. However, this can be disregarded, as it is a result of the interaction term being included in the model. Next, I check for extreme outliers using Cook's Distance, which does not yield any even remotely significant outliers. Finally, we check for linearity of predictors against log odds by plotting them. Unfortunately, `Smoking` does not appear to have a very linear relationship with its log odds. However, I do not believe there is much to be done about this. It is the nature of smoking that yields these results. I was unable to find any interactions with Smoking that would be consistently significant in the model, and while transformations make the plot look better, they were never more significant than the untransformed variable when used in models.
+
+```{r}
+vif(step.model)
+
+step.model.data <- augment(step.model) %>% mutate(index = 1:n())
+
+ggplot(step.model.data, aes(index, .std.resid)) + geom_point(alpha = .5) + geom_ref_line(h=3)
+
+plot(step.model, which=4, id.n = 5)
+
+logodds <- step.model$linear.predictors
+# car::boxTidwell(logodds ~ StartAge + MRW + Cholesterol + Systolic, data=train)
+par(mfrow = c(2,3))
+plot(logodds ~ StartAge + MRW + Cholesterol + Systolic + Smoking + Sex*Cholesterol, data=train)
+```
+
+I now attempt to use this model to predict `CHDStatus` for the test data. Among the diagnostics, I will print: 
+Misclassification error: proportion of incorrectly classified outcomes from the predicted data compared to the actual data)
+
+Sensitivity: the proportion of correctly predicted outcomes (proportion of people who the model predicted would be diagnosed with CHD and actually were)
+
+Specificity: the proportion of true negatives (proportion of people the model predicted would not be diagnosed with CHD who actually weren't)
+
+Confusion Matrix: 2x2 matrix where the columns are model predictions and the rows are actual outcomes
+
+Note that I used the `optimalCutoff` function to specify a value to use for the probability threshold between what would be designated a `1` (predicted CHD) vs. a `0` (predicted non-CHD). I did this because the model predictions don't range from 0 to 1. This function chooses a cutoff probability that will minimize misclassification error. 
+
+I also plot the ROC (receiver operator characteristic) curve and store the point estimate, upper bound, and lower bound of a 95% confidence interval for the AUC (area under curve), which determine the model's accuracy (higher AUC indicates higher accuracy).
+
+```{r}
+# Predictions as well as optimal threshold and confusion matrix for stepwise model
+pred <- predict(step.model, test, type="response")
+opt <- optimalCutoff(test$CHDStatus, pred)[1]
+confusionMatrix(test$CHDStatus, pred)
+
+# Sensitivity, specificity, and misclassification error
+sens.step <- sensitivity(test$CHDStatus, pred, threshold=opt)
+spec.step <- specificity(test$CHDStatus, pred, threshold=opt)
+mce.step <- misClassError(test$CHDStatus, pred, threshold=opt)
+sens.step
+spec.step
+mce.step
+
+# ROC curve and confidence interval for AUC
+plot(rocit(pred, test$CHDStatus))
+plot(ciROC(rocit(pred, test$CHDStatus)))
+point.step <- ciAUC(rocit(pred, test$CHDStatus))[[1]]
+lb.step <- ciAUC(rocit(pred, test$CHDStatus))[[5]]
+ub.step <- ciAUC(rocit(pred, test$CHDStatus))[[6]]
+
+#53 (.7459), 108 (.7344), 144 (.7385), 176 (.7509), 186 (.7443), 216 (.7343), 228 (.7377)
+# 231 (.7412), 252 (.7415), 314 (.7496), 320 (.7649), 400 (.7559), 487 (.7409)
+```
+
+Based on these diagnostics, the model appears to be about 75% accurate in its diagnoses. However, it has rather low sensitivity, meaning that it isn't very good at determining when someone will contract a coronary heart disease. This isn't shocking, as genetic and environmental factors can contribute to people's susceptibility to coronary heart disease, and this model is unable to consider these things. 
+
+However, there was another thing I noticed. I ran this process with many different seeds, and I noticed that the final model varied in terms of which coefficients were included. Most notably, there were quite a few two-way interactions that would be present in some models and absent from others. Of the many seeds I tested, this one (`320`) yielded the highest point estimate (~.7649). Most of the others ranged from .68-.72.
+
+Stepwise selection has a few troublesome shortcomings. Firstly, and most obviously, this process conducts several single-parameter t-tests, which means that it is very likely to include unnecessary independent variables in the model, and also likely to omit important variables (Type I and Type II errors, respectively). This is also not necessarily an inherent fault of stepwise selection, but it is usually not set up to include higher-order or interaction terms (and setting it up to do so would further exacerbate the flaws described above), so that is something to consider when attempting to use it to select variables for a model. So I wanted to try to find another way to try and find the best possible model.
+
+# Second Model(s): LASSO
+
+I chose to try making a new model with LASSO selection. LASSO is an acronym for “Least Absolute Shrinkage Selection Operator.” It is a selection method that seeks to address the issue of multicollinearity (highly-correlated independent variables). It achieves this by 'penalizing' a model for having more predictors, meaning that only predictors whose significance can 'overpower' the penalty are kept in the model. The logistic group LASSO estimator $\hat{\beta_{\lambda}}$ is given by the minimizer of the convex function
+
+$$S_{\lambda}(\beta) = -l(\beta) + \lambda\sum_{g=1}^G s(\text{df}_g) \| \beta_g \|_2$$
+where $l(\beta)$ is the log-likelihood function, and the tuning parameter $\lambda$ is a non-negative real number that dictates the amount of penalization (http://people.ee.duke.edu/~lcarin/lukas-sara-peter.pdf). Put more simply, LASSO maximizes the log-likelihood function for $\sum\limits_{g=1}^G |{\beta_g}| \leq s$. One consequence of this is that LASSO can completely remove insignificant predictors by sending their values to 0, making it a very powerful variable-selection tool. I first performed LASSO selection with cross-validation, which 'folds' the data a predetermined number of times, and tests the performance of a model on each fold with different values of $\lambda$ and a fixed value of $\alpha$ (where $\alpha=0$ yields the same results as normal logistic regression, and increasing $\alpha$ increases the emphasis on penalizing the coefficients). I tested the accuracy of the resulting models (using only all two-way interactions this time, which I will elaborate on later), storing the same diagnostic metrics I did in my stepwise model, for the ones with the best outcomes (out of all combinations of $\alpha = 1, \alpha=.5, \lambda = \lambda_{\text{min}}, \lambda = \lambda_{\text{1se}}$). 
+
+```{r}
+# Remove factor variables that won't be used in this model so I don't have to type them all out in the actual model
+train.lasso <-train[,!names(train) %in% c("DeathAge", "Status", "id", "DeathCause", "CHDAge", "BPStatus", "SmokeStatus", "WeightStatus", "CholStatus")]
+test.lasso <-test[,!names(test) %in% c("DeathAge", "Status", "id", "DeathCause", "CHDAge", "BPStatus", "SmokeStatus", "WeightStatus", "CholStatus")]
+
+x <- model.matrix(CHDStatus~.*., train.lasso)[,-1]
+lambdas <- 10^{seq(from=-5, to=0, length=100)}
+y <- train$CHDStatus
+foldid <- sample(1:10, size = length(y), replace = TRUE)
+
+# perform cross-validation with alpha= 0, .5, and 1
+chd.lasso1 <- cv.glmnet(x,y, family="binomial", foldid=foldid, type.measure = "auc", lambda=lambdas, alpha=1)
+chd.lasso.5 <- cv.glmnet(x,y, family="binomial", foldid=foldid, type.measure = "auc", lambda=lambdas, alpha=.5)
+chd.lasso0 <- cv.glmnet(x,y, family="binomial", foldid=foldid, type.measure = "auc", lambda=lambdas, alpha=0)
+
+# plots to identify the best alpha value from the above cv
+par(mfrow = c(2,2))
+plot(chd.lasso1); plot(chd.lasso.5); plot(chd.lasso0)
+plot(log(chd.lasso1$lambda), chd.lasso1$cvm, pch=19, col="red", xlab="log(Lambda)", ylab="MSE")
+points(log(chd.lasso.5$lambda), chd.lasso.5$cvm, pch=19, col="black")
+points(log(chd.lasso0$lambda), chd.lasso0$cvm, pch=19, col="blue")
+legend("bottomleft", legend =c("alpha = 1", "alpha = .5", "alpha = 0"), pch=19, col=c("red", "black", "blue"))
+
+
+# LASSO models with alpha=1 and alpha=.5, and using lambda.min and lambda.1se
+
+lasso.minmodel <- glmnet(x,y, family="binomial", alpha=1, lambda=chd.lasso1$lambda.min)
+lasso.minmodel.5 <- glmnet(x,y, family="binomial", alpha=.5, lambda=chd.lasso.5$lambda.min)
+lasso.1semodel <- glmnet(x,y, family="binomial", alpha=1, lambda=chd.lasso1$lambda.1se)
+lasso.1semodel.5 <- glmnet(x,y, family="binomial", alpha=.5, lambda=chd.lasso.5$lambda.1se)
+coef(lasso.minmodel.5)
+vars <- varImp(lasso.minmodel.5, lambda=chd.lasso.5$lambda.min)
+vars <- filter(vars, Overall !=0)
+
+# prediction using the above LASSO models
+x.test <- model.matrix(CHDStatus~.*., test.lasso)[,-1]
+
+probs.min <- lasso.minmodel %>% predict(newx = x.test, type="response")
+optmin <- optimalCutoff(test$CHDStatus, probs.min)[1]
+pred.class.min <- ifelse(probs.min > optmin, 1, 0)
+obs.class.min <- test$CHDStatus
+mean(pred.class.min==obs.class.min)
+
+sens.lmin <- sensitivity(test$CHDStatus, probs.min, threshold=optmin)
+spec.lmin <- specificity(test$CHDStatus, probs.min, threshold=optmin)
+mce.lmin <- misClassError(test$CHDStatus, probs.min, threshold=optmin)
+confusionMatrix(test$CHDStatus, pred.class.min)
+
+probs.1se <- lasso.1semodel.5 %>% predict(newx = x.test, type="response")
+opt1se <- optimalCutoff(test$CHDStatus, probs.1se)[1]
+pred.class.1se <- ifelse(probs.1se > opt1se, 1, 0)
+obs.class.1se <- test$CHDStatus
+mean(pred.class.1se==obs.class.1se)
+
+sens.l1se <- sensitivity(test$CHDStatus, probs.1se, threshold=opt1se)
+spec.l1se <- specificity(test$CHDStatus, probs.1se, threshold=opt1se)
+mce.l1se <- misClassError(test$CHDStatus, probs.1se, threshold=opt1se)
+confusionMatrix(test$CHDStatus, pred.class.1se)
+```
+
+```{r}
+# Plots of log(lambda) vs. coefficient values
+plot(chd.lasso1$glmnet.fit, xvar="lambda")
+abline(v=log(chd.lasso1$lambda.min))
+plot(chd.lasso.5$glmnet.fit, xvar="lambda")
+abline(v=log(chd.lasso.5$lambda.1se))
+
+# Diagnostics, ROC, and CI for AUC for these LASSO models
+assess.glmnet(lasso.minmodel, newx=x, newy=y)
+
+plot(roc.glmnet(lasso.minmodel, newx=x,newy=y), type="l")
+plot(rocit(as.vector(probs.min), test$CHDStatus))
+plot(ciROC(rocit(as.vector(probs.min), test$CHDStatus)))
+
+point.lmin <- ciAUC(rocit(as.vector(probs.min), test$CHDStatus))[[1]]
+lb.lmin <- ciAUC(rocit(as.vector(probs.min), test$CHDStatus))[[5]]
+ub.lmin <- ciAUC(rocit(as.vector(probs.min), test$CHDStatus))[[6]]
+
+point.l1se <- ciAUC(rocit(as.vector(probs.1se), test$CHDStatus))[[1]]
+lb.l1se <- ciAUC(rocit(as.vector(probs.1se), test$CHDStatus))[[5]]
+ub.l1se <- ciAUC(rocit(as.vector(probs.1se), test$CHDStatus))[[6]]
+```
+
+There are fewer misclassifications with this model compared to my stepwise model, and the sensitivity is much higher using LASSO. All other metrics came out only slightly different, which would lead me to believe that this model is better than my first model. However, there is one problem that is readily apparent when looking at the chosen variables.
+
+```{r}
+vars
+```
+As you can see, there are tons of two-way interaction terms included in this model, and there is no good way to interpret many of them, because there is so much overlap between them. Why would `Sex:Weight` and `Sex:StartAge` both be significant separately, if they couldn't potentially have a significant three-way interaction effect? And also notice that `Diastolic`, `Systolic`, `Weight`, and `MRW`, the two pairs of multicolinear predictors, are both in this model, due in large part to the interaction terms involving them. 
+
+Now, if I was asking about including three-way interactions, why not simply try it? I did. Changing the design matrix and the model to include all three-way interactions yielded the exact same results in all predictive metrics. And before that, I initially made the model with all possible interactions, which led to the coefficients of all lone predictors being reduced to 0, leaving me with a model full of 3,4, and 5-way interactions, which obviously can't work. So, I was forced to conclude that this model was overfit, and decided to make another LASSO model, this time with no interaction terms.
+
+```{r}
+# model with no interaction terms
+x.noint <- model.matrix(CHDStatus~., train.lasso)[,-1]
+
+chd.lasso.noint1 <- cv.glmnet(x.noint,y, foldid=foldid, family="binomial", type.measure="auc", lambda=lambdas, alpha=1)
+chd.lasso.noint.5 <- cv.glmnet(x.noint,y, foldid=foldid, family="binomial", type.measure="auc", lambda=lambdas, alpha=.5)
+chd.lasso.noint0 <- cv.glmnet(x.noint,y, foldid=foldid, family="binomial", type.measure="auc", lambda=lambdas, alpha=0)
+
+par(mfrow = c(2,2))
+plot(chd.lasso.noint1); plot(chd.lasso.noint.5); plot(chd.lasso.noint0)
+plot(log(chd.lasso.noint1$lambda), chd.lasso.noint1$cvm, pch=19, col="red", xlab="log(Lambda)", ylab="MSE")
+points(log(chd.lasso.noint.5$lambda), chd.lasso.noint.5$cvm, pch=19, col="black")
+points(log(chd.lasso.noint0$lambda), chd.lasso.noint0$cvm, pch=19, col="blue")
+legend("bottomleft", legend =c("alpha = 1", "alpha = .5", "alpha = 0"), pch=19, col=c("red", "black", "blue"))
+
+lasso.noint <- glmnet(x.noint,y, family="binomial", alpha=1, lambda=chd.lasso.noint1$lambda.min)
+lasso.noint.5 <- glmnet(x.noint,y, family="binomial", alpha=.5, lambda=chd.lasso.noint.5$lambda.min)
+lasso.noint.1se <- glmnet(x.noint,y, family="binomial", alpha=1, lambda=chd.lasso.noint1$lambda.1se)
+lasso.noint.5.1se <- glmnet(x.noint,y, family="binomial", alpha=.5, lambda=chd.lasso.noint.5$lambda.1se)
+coef(lasso.noint)
+
+vars.noint <- varImp(lasso.noint, lambda=chd.lasso.noint1$lambda.min)
+vars.noint <- filter(vars.noint, Overall !=0)
+vars.noint
+
+x.noint.test <- model.matrix(CHDStatus~., test.lasso)[,-1]
+
+probs.noint <- lasso.noint.1se %>% predict(newx = x.noint.test, type="response")
+opt.noint <- optimalCutoff(test$CHDStatus, probs.noint)[1]
+pred.class.noint <- ifelse(probs.noint > opt.noint, 1, 0)
+obs.class.noint <- test$CHDStatus
+mean(pred.class.noint==obs.class.noint)
+
+sens.noint.5 <- sensitivity(test$CHDStatus, probs.noint, threshold=opt.noint)
+spec.noint.5 <- specificity(test$CHDStatus, probs.noint, threshold=opt.noint)
+mce.noint.5 <- misClassError(test$CHDStatus, probs.noint, threshold=opt.noint)
+confusionMatrix(test$CHDStatus, pred.class.noint)
+```
+```{r}
+plot(chd.lasso.noint.5$glmnet.fit, xvar="lambda")
+abline(v=log(chd.lasso.noint.5$lambda.1se))
+
+assess.glmnet(lasso.noint, newx=x.noint, newy=y)
+plot(roc.glmnet(lasso.noint, newx=x.noint,newy=y), type="l")
+
+plot(rocit(as.vector(probs.noint), test$CHDStatus))
+plot(ciROC(rocit(as.vector(probs.noint), test$CHDStatus)))
+point.noint <- ciAUC(rocit(as.vector(probs.noint), test$CHDStatus))[[1]]
+lb.noint <- ciAUC(rocit(as.vector(probs.noint), test$CHDStatus))[[5]]
+ub.noint <- ciAUC(rocit(as.vector(probs.noint), test$CHDStatus))[[6]]
+```
+
+This model performs only marginally worse in predictive metrics (< 1%), and still outperforms the stepwise model, all without raising the concern of how to interpret its predictors. It also has the highest sensitivity of all models I tested (though in return it also has the lowest specificity). 
+
+# Takeaways and Conclusions
+
+Examining the results, we see that the model with no interactions is the most 'stable' model, as it has the lowest standard error, and the lowest disparity between specificity and sensitivity. However, it also has the highest misclassification error (though only by .1%). Given that it is also the easiest model to interpret, I would suggest that this be the final model. 
+
+```{r}
+coef(lasso.noint.1se)
+```
+
+So we have
+$$P(x) = \frac{e^{--3.531 + .2605x_1 + .02017x_2 + .00144 x_3 + .00526x_4 + .00269x_5}}{1+e^{-3.531 + .2605x_1 + .02017x_2 + .00144 x_3 + .00526x_4 + .00269x_5}}$$
+
+
+
+
+Unfortunately, even the upper bound for prediction accuracy is only about 80%. As stated before, this shouldn't be a discouraging result, because genetic and environmental factors not accounted for in this dataset are likely significant contributors to people being diagnosed with coronary heart disease despite being healthy by the metrics given here, and vice versa.
+
+```{r}
+model <- c("Stepwise", "LASSO.min", "LASSO.1se", "LASSO.noint.5")
+sens <- c(sens.step, sens.lmin, sens.l1se, sens.noint.5)
+spec <- c(spec.step, spec.lmin, spec.l1se, spec.noint.5)
+mce <- c(mce.step, mce.lmin, mce.l1se, mce.noint.5)
+AUC.est <- c(point.step, point.lmin, point.l1se, point.noint)
+ub <- c(ub.step, ub.lmin, ub.l1se, ub.noint)
+lb <- c(lb.step, lb.lmin, lb.l1se, lb.noint)
+
+results <- data.frame(model, sens, spec, mce, AUC.est, ub, lb)
+results
+```
+
+# Shortcomings and Further Possibilities
+
+Frankly, I feel that this is the most important section of this project, because I think I fell short of coming up with a truly good model in many respects. Firstly, my inability to design a method with reliably good interactions. I found an interesting library called `glinternet` that can perform logistic LASSO selection and find significant interactions by itself, but I was unable to get it to work properly. This could have yielded a 'true' model. If you look at my .rmd file, you will see the code for that below (further details here: https://cran.r-project.org/web/packages/glinternet/glinternet.pdf).
+
+I think that, in particular, `Smoking`, `Sex`, and `StartAge` were all predictors that could have potentially had statistically significant interactions.
+
+
+```{r, echo=FALSE}
+# This is a failed attempt to use a library that would consider interaction terms on its own, without needing them to be fed into the model
+
+
+# heart1 <- heart 
+# heart1 <- heart1[,-19]
+# numLevels <- heart1 %>% sapply(nlevels)
+# numLevels[numLevels==0] <- 1
+# 
+# heart1[fac_cols] <- lapply(heart1[fac_cols],as.numeric)
+# heart1[,c(fac_cols)] = (heart1[,c(fac_cols)] - 1)
+# heart1<-heart1[,-c(1,2,3,12)]
+# 
+# heart1$id <- 1:nrow(heart1)
+# train1 <- heart1 %>% sample_frac(.8)
+# train1 <- train1[,-15]
+# test1 <- anti_join(heart1, train, by='id')
+# test1 <- test1[,-15]
+# heart1 <- heart1[,-15]
+# 
+# y <- train1$CHDStatus
+# y<- as.numeric(y)
+# y <- y-1
+# numLevels <- numLevels[-c(1,2,3,12,18)]
+# x.glinternet <- model.matrix(CHDStatus~., data=train1)[,-1]
+# cv_fit <- glinternet(x.glinternet, y, numLevels, family="binomial")
+# cv_fit
+```
+
+I also was unable to implement ridge and elastic net selection models properly. I had difficulty doing anything at all with a ridge model, which is strange to me, because I don't think it should be done much differently from LASSO. A potential benefit of using ridge selection would have been that it wouldn't send unnecessary variables to exactly 0, but it could reduce their coefficients to almost zero, which could allow me to decide for myself which predictors to use. And elastic net, as I understand it, is basically a combination of ridge and LASSO (but I will confess that I did not have enough time to properly familiarize myself with the theory behind elastic net). The code for my attempted elastic net model is below (in the .rmd file) as well.
+
+```{r, echo=FALSE}
+# This is a failed attempt at elastic net regression. 
+
+# elastic <- train(CHDStatus~.^2, data=train.lasso, family="binomial", trControl = trainControl("cv", number=10), tuneLength=10)
+# elastic$bestTune
+# coef(elastic$finalModel, elastic$bestTune$lambda)
+# plot(elastic)
+# xt <- x.test[,-1]
+# elastic.pred <- elastic %>% predict(newx = xt, type="prob")
+# summary(elastic.pred)
+# opt.elastic <- optimalCutoff(test$CHDStatus, elastic.pred$`1`)[1]
+# elastic.class.noint <- ifelse(elastic.pred > opt.elastic[2], 1, 0)
+# obs.class.elastic <- test$CHDStatus
+# mean(elastic.class.noint==obs.class.elastic)
+```
+
+A final shortcoming (though I don't think this is really my fault) that I only found out about when trying to find good diagnostic metrics for LASSO models is that apparently there is currently no agreed-upon significance test for LASSO models (further reading: https://tibshirani.su.domains/ftp/covtest.pdf). I also tried to refrence https://strakaps.github.io/post/glinternet/ for guidance on using this library.
+
+# Post-Presentation Revisions
+
+As I mentioned in my presentation, I thought it may be wise to try building a model based only on people who were either already dead or who already had been diagnosed with coronary heart disease. This is because many of the still living people in this dataset without coronary heart disease are likely to be diagnosed with it later in their lives, meaning that my model could be making misclassification errors on observations in the present that later turn out to be correct predictions. So I decided to try it out and see what would happen.
+
+```{r}
+chdead <- subset(heart, Status == "Dead" | CHDStatus == 1)
+nrow(chdead)
+set.seed(320)
+chdead$id <- 1:nrow(chdead)
+train.chdead <- chdead %>% sample_frac(.8)
+test.chdead <- anti_join(chdead, train.chdead, by='id')
+
+full.model.chdead <- glm(CHDStatus ~ Sex + StartAge + Height + Weight + Diastolic + Systolic + MRW + Smoking + Cholesterol + CholStatus + BPStatus + WeightStatus + SmokeStatus + Sex*StartAge*Height*MRW*Weight*Systolic*Smoking*Cholesterol, na.action = na.omit, family = "binomial", data = train.chdead)
+
+# null model to compare stepwise model against
+null.model.chdead <- glm(CHDStatus ~ 1, family = "binomial", data=train.chdead)
+
+# Optimal model created by stepwise selection
+step.model.chdead <- step(null.model.chdead, scope = list(upper=full.model.chdead), direction="both", text="Chisq", trace=F)
+summary(step.model.chdead)
+```
+
+```{r}
+pred.chdead <- predict(step.model.chdead, test.chdead, type="response")
+opt.chdead <- optimalCutoff(test.chdead$CHDStatus, pred.chdead)[1]
+confusionMatrix(test.chdead$CHDStatus, pred.chdead)
+
+# Sensitivity, specificity, and misclassification error
+sens.chd <- sensitivity(test.chdead$CHDStatus, pred.chdead, threshold=opt.chdead)
+spec.chd <- specificity(test.chdead$CHDStatus, pred.chdead, threshold=opt.chdead)
+mce.chd <- misClassError(test.chdead$CHDStatus, pred.chdead, threshold=opt.chdead)
+sens.chd
+spec.chd
+mce.chd
+
+# ROC curve and confidence interval for AUC
+plot(rocit(pred.chdead, test.chdead$CHDStatus))
+plot(ciROC(rocit(pred.chdead, test.chdead$CHDStatus)))
+point.chd <- ciAUC(rocit(pred.chdead, test.chdead$CHDStatus))[[1]]
+lb.chd <- ciAUC(rocit(pred.chdead, test.chdead$CHDStatus))[[5]]
+ub.chd <- ciAUC(rocit(pred.chdead, test.chdead$CHDStatus))[[6]]
+
+results[5,] = c("CHDead", sens.chd, spec.chd, mce.chd, point.chd, ub.chd, lb.chd)
+results
+```
+Interestingly enough, this model has worse predictive accuracy (~62%) than any of my other models (~75%). However, it has much higher sensitivity than any of the other models, meaning it is much better at correctly predicting whether or not someone will be diagnosed with coronary heart disease. While this is the outcome I was hoping for, it is also to be expected, as having coronary heart disease is a much more common outcome in this filtered data frame. Ultimately, this is the worst-performing model yet, so my hunch was incorrect. Testing with a few other seeds, I was able to obtain sensitivity above .8 in some cases (more than double the sensitivity of my best model), but the specificity, misclassification error, and AUC estimates were always much worse than those of my other models, meaning that using this data leads models to more freely predict that someone will be diagnosed with coronary heart disease. In practice, it is probably safer for medical professionals to adopt a 'high-sensitivity' philosophy when dealing with patients, as it is much safer to tell someone they should make efforts to lower their smoking, blood pressure, cholesterol, or weight (if any of these things are at unhealthy levels) than it is to say that they need not be concerned, as they are not likely to develop coronary heart disease. I imagine that using a model that considers `DeathAge` for people who didn't die in accidents - independent of heart disease - would show that these positively-correlated predictors of heart disease are also strong predictors of shorter lifespan in general. So, if I were to give a recommendation for a client focused on healthcare, I may consider this last model, or one similar to it. However, for my own personal goal of predictive accuracy and interpretability, `LASSO.noint.5` is still the best.
+
+# References 
+Diagnostics for Logistic Regression: 
+
+1. https://www.rdocumentation.org/packages/InformationValue/versions/1.2.3
+
+2. https://rviews.rstudio.com/2019/03/01/some-r-packages-for-roc-curves/ 
+
+3. http://www.sthda.com/english/articles/36-classification-methods-essentials/148-logistic-regression-assumptions-and-diagnostics-in-r/ 
+
+
+Theoretical Background on Logistic LASSO:
+
+1. http://people.ee.duke.edu/~lcarin/lukas-sara-peter.pdf 
+
+
+Implementation and Diagnostics of LASSO: 
+
+1. http://www.sthda.com/english/articles/36-classification-methods-essentials/149-penalized-logistic-regression-essentials-in-r-ridge-lasso-and-elastic-net/
+
+2. https://bookdown.org/tpinto_home/Regularisation/lasso-regression.html
+
+3. https://stats.oarc.ucla.edu/r/dae/logit-regression/ 
+
+4. https://glmnet.stanford.edu/articles/glmnet.html 
+
+5. https://stackoverflow.com/questions/48717395/glmnet-multinomial-prediction-returned-object/48719493#48719493 
