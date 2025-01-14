@@ -1,0 +1,902 @@
+---
+title: "STA 610 Final Analysis"
+author: "John Gillen"
+date: "2024-12-08"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+
+```{r, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(lme4)
+library(GGally)
+library(car)
+library(DHARMa) # https://cran.r-project.org/web/packages/DHARMa/vignettes/DHARMa.html#budworm-example-count-proportion-nk-binomial
+wasl = read.csv("/Users/john/Desktop/wasl.csv")
+```
+
+# Introduction
+
+The WASL dataset contains information from schools in Washington regarding their academic resources (how experienced their teachers are on average, student:teacher ratio, etc.) and student demographics (percent of white students, proportion of students eligible for free or reduced cost meals), as well as general information (county, school name, etc.), and data on the number of 5th or 10th graders who took and the number who passed the WASL in reading, math, science, and (for 10th graders only) writing during the 2005-2006 school year.
+
+In this analysis, I aimed to build a sensible statistical model to explain the variation in pass rates of schools. In particular, I wanted to find out if staffing or resource-related information (student:teacher ratio, years of experience of teachers, percent of teachers with Master’s degree or higher) truly moved the needle when it came to schools’ performances on the WASL, compared to demographic information. In short, I found demographic information to be an unequivocally stronger predictor of performance, and further found that experience and education of teachers in particular was of negligible importance (which was somewhat disheartening as someone with an interest in teaching). I was also curious to see if there were any specific characteristics of schools whose pass rates were not well-fit by my model, but none of the explanatory variables were helpful in this regard - the best indicator of a likely outlier was extremely high or extremely low (close to 100% or close to 0%) pass rate.
+
+# Exploratory Analysis/Cleaning
+
+There is a hierarchical structure to the data: We have grades nested in schools nested in counties, and then subjects that represent repeated measures across grade levels (except for writing) within schools within counties. There are 39 counties represented in the data and 1481 schools. Of the three subjects taken by both grade levels, on average about 94 students per school took the tests. This is a rather right-tailed distribution, as the median is 67, with the maximum values being close to 800 for each subject. The number of schools at which 10th graders were tested is 416 compared to 1065 for 5th graders. Mean enrollment for the schools is about 522, with a median of 439.
+
+## Cleaning 
+
+There are 66 rows with missing information in the demographic or resource-related variables. I choose to remove these rows. Rows with missing test-related information can possibly be handled with a different approach. Obviously the 5th grade rows will all be missing information about writing scores, so we can ignore these.
+
+After removing the 66 rows with missing ‘school’ information, there are 15 rows with missing ‘test’ information (excluding those who have missing writing information due to being 5th graders). More specifically, these schools reported the number of students who took each (applicable) test, but didn’t report the number who passed (e.g. John Marshall High School reported that 7 students took the math test and 8 took the reading and science tests, but do not report how many passed for either of these).
+
+A reasonable assumption may be that schools who didn’t report the number of students who passed did so because no students passed. Looking at the 15 rows with missing results, only one of them reported 0 students passing for one subject while not reporting for another subject. In this case, we should consider it unlikely that they would have not reported the other zero, so we eliminate this row (though ironically it looks probable that it should have been a zero). For the rest, we can use our knowledge of the data to try and guess which unreported scores were highly likely to have been zeroes. We know that reading and writing scores are the highest with about 80% passing on average, with math being noticeably lower, and science the lowest. So we will delete the schools who didn’t report data for reading or writing (for 10th grade), as it is unlikely that these would be zeroes given that they had nonzero pass rates for math and/or science. Of the 9 rows remaining, there are two who didn’t report math scores and none who reported science scores. If we disregard the rows where both aren’t reported, the remaining 7 schools all have very low math pass rates (max of 5/15, next best is 2/10), and all had fewer students take the science test than the math test. I believe it is reasonable to assume that these schools all had 0 students pass the science test. We drop the other 8 rows.
+
+```{r}
+wasl = wasl %>% # Checked with AI to see why |> wouldn't work here
+  filter(rowSums(is.na(select(., TotalEnrollment, PercentWhite, StudentsPerClassroomTeacher, 
+                              FreeorReducedPricedMeals, AvgYearsEducationalExperience, 
+                              PercentTeachersWithAtLeastMasterDegree))) == 0)
+
+na_schools = wasl |>
+  filter((is.na(ReadingMetStandard) | is.na(MathMetStandard) | is.na(ScienceMetStandard) | (is.na(WritingMetStandard)) &
+         WritingTotalTested != 0))
+
+# AI was used to figure out the mutate to get the count of zeroes
+na_schools = na_schools |>
+  filter(!is.na(ReadingMetStandard | 
+                  is.na(WritingMetStandard) & GradeTested == 10) &
+           xor(is.na(MathMetStandard), is.na(ScienceMetStandard))) |>
+  rowwise() |>
+  mutate(zeroes = sum(c_across(c(ReadingMetStandard, MathMetStandard, ScienceMetStandard, WritingMetStandard)) == 0, na.rm = TRUE)) |>
+  filter(zeroes == 0) |>
+  select(-zeroes)
+na_schools[is.na(na_schools)] = 0
+
+wasl = wasl |>
+  mutate(ScienceMetStandard = ifelse(is.na(ScienceMetStandard) & 
+                                     paste(County, School) %in% 
+                                     paste(na_schools$County, na_schools$School), 
+                                     0, ScienceMetStandard))
+```
+
+
+```{r}
+wasl = wasl |>
+  filter(if_all(-WritingMetStandard, ~ !is.na(.)))
+
+#AI was used for the pivot_longer
+wasl_num = wasl |> 
+  pivot_longer(
+    cols = starts_with("MathMetStandard"):starts_with("ScienceTotalTested"),
+    names_to = c("Subject", ".value"),
+    names_pattern = "(Math|Reading|Science|Writing)(.*)"
+  ) |>
+  mutate(PropPassed = MetStandard/TotalTested,
+         Subject = factor(Subject, levels = c("Reading", "Writing", "Math", "Science"))
+  )
+
+wasl_num$GradeTested = as.factor(wasl_num$GradeTested)
+
+wasl_num = wasl_num |>
+  filter(!(Subject == "Writing" & GradeTested == 5))
+```
+
+Something strange (that I definitely noticed before fitting several models) is going on here: some schools seem to have submitted two sets of score data for the same grade level. It is unclear whether these come from different years, since all other information is the same. Let's look at the outcomes and see if that can give any insight on how to proceed.
+
+```{r}
+duplicate_schools = wasl_num |>
+  group_by(School, County) |>
+  summarize(
+    Total_Count = n(),
+    Grade5_Count = sum(GradeTested == 5, na.rm = TRUE),
+    Grade10_Count = sum(GradeTested == 10, na.rm = TRUE),
+    .groups = "drop" # Ran my existing code through an LLM to get this piece
+  ) |>
+  filter(Total_Count > 3 & (Grade5_Count > 3 | Grade10_Count > 4)) |>
+  mutate(School_County = paste(School, County, sep = "_")) |>
+  select(School_County)
+
+duplicate_df = wasl_num |>
+  mutate(School_County = paste(School, County, sep = "_")) |>
+  filter(School_County %in% duplicate_schools$School_County) |>
+  select(-School_County)
+
+
+duplicate_df = duplicate_df |>
+  mutate(
+    PropPassed = MetStandard / TotalTested,
+    lb = pmax(0,PropPassed - 1.96 * sqrt((PropPassed * (1 - PropPassed)) / TotalTested)),
+    ub = pmin(1,PropPassed + 1.96 * sqrt((PropPassed * (1 - PropPassed)) / TotalTested))
+  )
+
+ggplot(duplicate_df, aes(x = Subject, y = PropPassed, color = Subject)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lb, ymax = ub), width = 0.2) + # Used an LLM to get the error bars
+  facet_wrap(.~School) +
+  labs(
+    title = "Proportion Passed by Subject with CIs",
+    x = "Subject",
+    y = "Pass Rate",
+    color = "Subject"
+  )
+```
+
+This is quite troubling. For some schools, the outcomes are close enough that we can reasonably conclude that the duplicates are a result of separate test dates or different years. However, for some others, the subject-wise scores are drastically different. There are a few ways we can proceed here:
+
+1. Do nothing at all - This can be problematic for the schools with extreme differences when we are fitting models.
+
+2. Combine the duplicate data - This seems reasonable, given that the duplicate scores are reported by the same school. We shouldn't expect year-to-year results to vary too much, so the schools with big differences may have been grouping their reported scores by some other factor, which means combining the duplicates should give us a better idea of their true performance (but again this may not be wise given that we don't know what factor the students are separated by)
+
+3. Drop one or both rows for the duplicates - Luckily, as we can see below, the counties with duplicated data are quite large, and there would only be 11 schools to remove. Dropping one observation is problematic for the duplicates with very different outcomes, so the only viable option here would really be to drop both.
+
+```{r}
+counties_with_duplicates = duplicate_df |>
+  distinct(County) |>
+  pull(County)
+
+schools_in_counties = wasl |>
+  filter(County %in% counties_with_duplicates) |>
+  distinct(School, County)
+
+schools_in_counties |>
+  group_by(County) |>
+  summarize(Schools = n(), .groups = "drop")
+```
+
+I will choose to remove all schools that were duplicated. It was difficult to decide between this and combining, but I think this is the safer option given that we don't know why the duplicates were separated.
+
+```{r}
+# Delete
+duplicate_schools = duplicate_df |>
+  distinct(School, County)
+
+wasl_num = wasl_num |>
+  anti_join(duplicate_schools, by = c("School", "County"))
+
+# Combine
+# combined_duplicates = wasl_num |>
+#   semi_join(duplicate_schools, by = c("School", "County")) |>
+#   group_by(School, County, Subject) |>
+#   summarize(
+#     TotalTested = sum(TotalTested, na.rm = TRUE),
+#     MetStandard = sum(MetStandard, na.rm = TRUE),
+#     .groups = "drop"
+#   ) |>
+#   mutate(
+#     PropPassed = MetStandard / TotalTested
+#   )
+# 
+# non_dupes = wasl_num |>
+#   anti_join(duplicate_schools, by = c("School", "County"))
+# 
+# combined_wasl_num = bind_rows(non_dupes, combined_duplicates)
+# 
+# print(combined_wasl_num)
+```
+
+
+## Exploratory Visualization
+
+Now for some exploratory visualization. Consider the structure of the data: we have counties that contain schools that contain grade(s) being tested on subjects. We first want to just get a look at each of these variables in isolation (note that we will always have to consider subject paired with grade in some capacity due to the absence of a writing test for 5th graders)
+
+```{r, warning = F}
+ggplot(wasl_num, aes(x = County, y = PropPassed)) +
+  geom_boxplot() +
+  coord_flip()
+```
+
+```{r, warning = F}
+set.seed(14727)
+county_sample = sample(unique(wasl_num$County), 30)
+sampled_schools = wasl_num |>
+  filter(County %in% county_sample) |>
+  distinct(County, School) |>
+  group_by(County) |>
+  sample_n(1)
+
+sampled_schools = wasl_num |>
+  semi_join(sampled_schools, by = c("County", "School"))
+
+ggplot(sampled_schools, aes(x = School, y = PropPassed))+
+  geom_boxplot() +
+  geom_point() +
+  coord_flip() +
+  labs(tilte = "Pass Rate Between Schools From Different Counties")
+```
+
+```{r, warning = F}
+ggplot(wasl_num, aes(x = Subject, y = PropPassed)) +
+  geom_boxplot() +
+  facet_wrap(.~GradeTested)
+```
+
+We observe not a ton of apparent between-county variance, but quite a lot between subjects overall and schools across counties. There is also lots of within-county variance and moderate between grade variance by subject. Note that not many schools test both grades, so almost all within-school variance should be explained by subject. We now check for variance in subjects at the county and school levels, and schools within counties.
+
+```{r}
+ggplot(wasl_num, aes(x = County, y = PropPassed)) +
+  geom_boxplot() +
+  coord_flip() +
+  facet_wrap(.~Subject) +
+  labs(title = "County Pass Rate by Subject")
+```
+
+```{r, warning = F}
+ggplot(sampled_schools, aes(x = School, y = PropPassed, fill = Subject))+
+  geom_bar(stat = "identity", position = "identity", alpha = 0.5) +
+  coord_flip() +
+  theme_void() +
+  facet_wrap(.~Subject) +
+  labs(title = "Pass Rate by Subject for 30 Schools from Different Counties")
+```
+
+```{r, warning = F}
+set.seed(7252)
+big_counties = wasl_num |>
+  group_by(County) |>
+  summarise(num_schools = n_distinct(School)) |>
+  filter(num_schools >= 25) |>
+  pull(County)
+
+county_sample = sample(big_counties, 9)
+
+big_sample = wasl_num |>
+  filter(County %in% county_sample)
+big_sample = big_sample |>
+  group_by(County, School) |>
+  mutate(School = reorder(School, PropPassed, FUN = median))
+
+
+sampled_schools = wasl_num |>
+  filter(County %in% big_sample$County) |>
+  distinct(County, School) |>
+  group_by(County) |>
+  sample_n(25)
+
+sampled_schools = wasl_num |>
+  semi_join(sampled_schools, by = c("County", "School")) |>
+  group_by(School) |>
+  mutate(School = reorder(School, PropPassed, FUN = mean))
+
+p1 = ggplot(sampled_schools, aes(x = School, y = PropPassed)) +
+  geom_point(aes(color = Subject), size = 1.5, alpha = 0.6) +
+  facet_wrap(~ County, scales = "free_x") +
+  labs(title = "Pass Rate by Subject by Schools Within Counties",
+       x = "School",
+       y = "Pass Rate") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+
+sampled_schools_ci_sub = sampled_schools |>
+  mutate(
+    PropPassed = MetStandard / TotalTested,
+    lb = pmax(0, PropPassed - 1.96 * sqrt((PropPassed * (1 - PropPassed)) / TotalTested)),
+    ub = pmin(1, PropPassed + 1.96 * sqrt((PropPassed * (1 - PropPassed)) / TotalTested)) 
+  )
+
+non_overlap_subjects = sampled_schools_ci_sub |>
+  group_by(County, Subject) |>
+  arrange(lb) |>
+  mutate(
+    Group = cumsum(lag(ub, default = first(lb)) < lb) 
+  ) |>
+  ungroup()
+non_overlap_subjects$Group = as.factor(non_overlap_subjects$Group)
+p2 = ggplot(non_overlap_subjects, aes(x = School, y = PropPassed)) +
+  geom_point(aes(pch = Subject, color = Group), size = 1.5) +  # Unique color for subject + group
+  geom_errorbar(aes(ymin = lb, ymax = ub, color = Group), width = 0.2) +
+  labs(
+    title = "Non-Overlapping Confidence Intervals by Subject and County",
+    x = "School",
+    y = "Pass Rate"
+  ) +
+  facet_wrap(.~County) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+print(p1)
+print(p2)
+```
+There appears to be some effect within subjects across counties and schools (but this may be explaiend by between-county differences). There also seems to be variability between schools within counties, based on a sample of schools from some of the larger counties.
+
+Though I want to account for the above factors before getting into the demographic and resource variables, let's just have a glance at them for now:
+
+```{r}
+p3 = ggplot(wasl_num, aes(x = PercentWhite, y = PropPassed, group = interaction(County,Subject), color = Subject)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "lm", se = F) +
+  facet_wrap(.~GradeTested)
+
+p4 = ggplot(wasl_num, aes(x = FreeorReducedPricedMeals, y = PropPassed, group = interaction(County,Subject), color = Subject)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "lm", se = F) +
+  facet_wrap(.~GradeTested)
+
+p5 = ggplot(wasl_num, aes(x = TotalEnrollment, y = PropPassed, group = County)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = F) +
+  facet_wrap(.~Subject)
+
+p6 = ggplot(wasl_num, aes(x = PercentTeachersWithAtLeastMasterDegree, y = PropPassed, col = GradeTested)) +
+  geom_point() +
+  facet_wrap(.~Subject)
+
+p7 = ggplot(wasl_num, aes(x = AvgYearsEducationalExperience, y = PropPassed, col = GradeTested)) +
+  geom_point() +
+  facet_wrap(.~Subject)
+
+p8 = ggplot(wasl_num, aes(x = StudentsPerClassroomTeacher, y = PropPassed, col = GradeTested)) +
+  geom_point() +
+  facet_wrap(.~Subject)
+
+print(p3)
+print(p4)
+print(p5)
+print(p6)
+print(p7)
+print(p8)
+```
+%White has some correlation with improvement in pass rates, %reduced cost meals has very strong negative correlation with pass rates for all grade levels and subjects, and most counties. Higher enrollment sees improvement in reading and writing and stability in math and science, and the other three variables don't show any obvious patterns. Let's see how they interact with each other:
+
+```{r, message = F}
+wasl_pairs = wasl_num |>
+  select(GradeTested, TotalEnrollment, PercentWhite, 
+         AvgYearsEducationalExperience, PercentTeachersWithAtLeastMasterDegree,
+         FreeorReducedPricedMeals, StudentsPerClassroomTeacher)
+ggpairs(wasl_pairs)
+```
+
+
+There is a somewhat strong negative correlation between %white and %reduced price meals. Other than that, there are some moderate correlations between other variables, but nothing noteworthy.
+
+
+# Model Fitting Process
+
+With this information, we are ready to fit some models. Given the nature of our response, we want to fit a binomial model using `glmer`. The only assumption we can check pre-fitting is that the data includes trials and successes/failures, which we already know it does. Also, it should be noted now that we will be evaluating models by BIC, and using DHARMa for diagnostics. DHARMa calculates standardized residual that make interpretation easier for complicated model structures, and performs several tests to make understanding residual patterns and validating assumptions convenient. It's also much easier to say than sbgcop.
+
+(more info here: https://cran.r-project.org/web/packages/DHARMa/vignettes/DHARMa.html )
+
+
+For starters, we will consider only a fixed effect for subject*grade (this will be encoded as a new variable to deal with the redundancy induced by grade and writing being perfectly correlated) and a random intercept for county. We will compare this against a model with only the county intercept, and then try adding a random intercept for school and a random intercept for school within county. We can try Subject_Grade as a random intercept as well to see if there is any difference.
+
+```{r}
+wasl_num$Subject_Grade = interaction(wasl_num$Subject, wasl_num$GradeTested)
+wasl_num$Subject_Grade = as.factor(wasl_num$Subject_Grade)
+wasl_num$Subject_Grade = droplevels(wasl_num$Subject_Grade)
+
+modcounty = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ (1|County), 
+                family = binomial, wasl_num)
+
+modbase = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + (1|County), 
+                family = binomial, wasl_num)
+
+modsub = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ (1|Subject_Grade) + (1|County), 
+                family = binomial, wasl_num)
+
+modsub_int = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ (1|Subject_Grade), 
+                family = binomial, wasl_num)
+
+
+anova(modcounty, modbase, modsub, modsub_int)
+```
+
+Including the fixed effect for subject*grade more than halves the BIC, and outperforms models treating the interaction as a random intercept, so we proceed with this model. Let's invoke DHARMa: 
+
+```{r}
+sim = simulateResiduals(modbase)
+plot(sim)
+print(testDispersion(sim))
+print(testOutliers(sim, type = "bootstrap"))
+```
+
+Clearly this model isn't an excellent one for our data. Let's try adding school or County:School-level intercepts:
+
+```{r}
+modsch = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + (1|School), 
+                family = binomial, wasl_num)
+modschcounty = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + (1|School) + (1|County), 
+                family = binomial, wasl_num)
+modboth = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + (1|County:School), 
+                family = binomial, wasl_num)
+modboth2 = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + (1|County/School), 
+                family = binomial, wasl_num, control = glmerControl(optimizer = "bobyqa"))
+anova(modbase, modsch, modschcounty, modboth, modboth2)
+```
+
+```{r}
+sim = simulateResiduals(modboth2)
+plot(sim)
+print(testDispersion(sim))
+print(testOutliers(sim, type = "bootstrap"))
+```
+```{r}
+plotResiduals(sim, wasl_num$County)
+```
+
+```{r}
+par(mfrow = c(1,2))
+ranef = ranef(modboth2)
+qqnorm(ranef$`School:County`$`(Intercept)`, main = "County:School")
+qqline(ranef$`School:County`$`(Intercept)`)
+       
+qqnorm(ranef$County$`(Intercept)`, main = "County")
+qqline(ranef$County$`(Intercept)`)
+```
+
+The `1|County:School` intercept reduces our BIC by over 40%! Furthermore, the DHARMa QQ plot shows a better shape and improvements across the board otherwise. Note that, as stated in the message in the code above, there is a tendency of the default outlier test to have inflated type 1 error rates for binomial data. Running the suggested alternative shows that the outliers are under control. Now we are in somewhat uncharted territory, but our 'base' model accounting for the 'global' factors is established. Let's look at the demographic factors. We can actually use DHARMa to help scout for potentially-usable variables in our model.
+
+```{r}
+plotResiduals(sim, wasl_num$PercentWhite)
+```
+```{r}
+plotResiduals(sim, wasl_num$FreeorReducedPricedMeals)
+```
+
+It looks like including effects for both %white and %reduced meal cost could help address some of the outliers. We may want to even try a random slope for %reduced meal cost. To circumvent convergence issues, we first scale our continuous predictors (and do logit transforms on the two proportional ones).
+
+```{r, warning = F, message = F}
+wasl_num = wasl_num |>
+  mutate(
+    PercentWhite_logit = logit(PercentWhite),
+    FreeorReducedPricedMeals_logit = logit(FreeorReducedPricedMeals),
+    stratio = scale(StudentsPerClassroomTeacher),
+    exp = scale(AvgYearsEducationalExperience),
+    mast = scale(PercentTeachersWithAtLeastMasterDegree)
+  )
+modw = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade +
+                   PercentWhite_logit + (1|County) +
+                (1|County:School), family = binomial, wasl_num,
+              control = glmerControl(optimizer = "bobyqa"))
+
+modm = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade +
+                   FreeorReducedPricedMeals_logit + (1|County) +
+                (1|County:School), family = binomial, wasl_num,
+              control = glmerControl(optimizer = "bobyqa"))
+
+
+modwm = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade +
+                   FreeorReducedPricedMeals_logit + PercentWhite_logit + (1|County) +
+                (1|County:School), family = binomial, wasl_num,
+              control = glmerControl(optimizer = "bobyqa"))
+
+
+anova(modboth2, modw, modm, modwm)
+```
+
+```{r}
+sim = simulateResiduals(modwm)
+plot(sim)
+print(testDispersion(sim))
+```
+
+
+```{r}
+plotResiduals(sim, wasl_num$Subject_Grade)
+```
+```{r}
+plotResiduals(sim, wasl_num$County)
+```
+```{r}
+plotResiduals(sim, droplevels(interaction(wasl_num$County, wasl_num$School)))
+```
+
+```{r}
+par(mfrow = c(1,2))
+ran = ranef(modwm)
+qqnorm(ran$County$`(Intercept)`, main = "County Intercept Q-Q Plot")
+qqline(ran$County$`(Intercept)`)
+qqnorm(ran$`County:School`$`(Intercept)`, main = "County:School Intercept Q-Q Plot")
+qqline(ran$`County:School`$`(Intercept)`)
+```
+
+Including both %white and %reduced cost meals improved our BIC by a lot, and substantially decreased within-group deviation for Subject_Grade and County, as well as homogenized the County:School variance. Let's check to see if there may be an interaction effect betweeen these two variables
+
+```{r}
+wasl_num$white_meal = wasl_num$PercentWhite*wasl_num$FreeorReducedPricedMeals
+plotResiduals(sim, wasl_num$white_meal)
+```
+
+It doesn't look like much, but it's worth trying:
+
+```{r}
+wasl_num = wasl_num |>
+  mutate(white_meal_logit = scale(white_meal))
+
+modwm_int = glmer(cbind(MetStandard, TotalTested - MetStandard) ~
+                    Subject_Grade + white_meal_logit + PercentWhite_logit +
+                    FreeorReducedPricedMeals_logit
+                    + (1|County) + (1|County:School), family = binomial, wasl_num,
+              control = glmerControl(optimizer = "bobyqa"))
+
+anova(modwm, modwm_int)
+```
+
+It didn't help. Recall from before that there may be evidence for a random slope of %reduced price meals instead of (or perhaps along with) a fixed effect. I can't figure out how to plot it in a manner that will let me discern what the random intercept should be for the slope, so we will just have to check a few possible terms.
+
+```{r}
+modwm_slope_c = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + 
+                    PercentWhite_logit + (FreeorReducedPricedMeals_logit | County) +
+                 (1|County/School), family = binomial, wasl_num, 
+               control = glmerControl(optimizer = "bobyqa"))
+
+modwm_both_c_corr = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + 
+                    FreeorReducedPricedMeals_logit + PercentWhite_logit + 
+                      (FreeorReducedPricedMeals_logit | County) +
+                 (1|County/School), family = binomial, wasl_num, 
+               control = glmerControl(optimizer = "bobyqa"))
+
+modwm_both_c = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + 
+                    FreeorReducedPricedMeals_logit + PercentWhite_logit + 
+                      (FreeorReducedPricedMeals_logit || County) +
+                 (1|County/School), family = binomial, wasl_num, 
+               control = glmerControl(optimizer = "bobyqa"))
+
+modwm_slope_cs = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + 
+                     PercentWhite_logit + (FreeorReducedPricedMeals_logit | County:Subject_Grade) + 
+                       (1|County/School), family = binomial, wasl_num, 
+               control = glmerControl(optimizer = "bobyqa"))
+
+modwm_both_cs_corr = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + 
+                    FreeorReducedPricedMeals_logit + PercentWhite_logit + 
+                      (FreeorReducedPricedMeals_logit | County:Subject_Grade) + 
+                 (1|County/School), family = binomial, wasl_num, 
+               control = glmerControl(optimizer = "bobyqa"))
+
+modwm_both_cs = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + 
+                    FreeorReducedPricedMeals_logit + PercentWhite_logit + 
+                      (FreeorReducedPricedMeals_logit || County:Subject_Grade) + 
+                 (1|County/School), family = binomial, wasl_num, 
+               control = glmerControl(optimizer = "bobyqa"))
+
+anova(modwm, modwm_slope_c, modwm_both_c, modwm_both_c_corr, modwm_slope_cs, modwm_both_cs_corr, modwm_both_cs)
+```
+
+```{r}
+sim = simulateResiduals(modwm_both_cs)
+plot(sim)
+print(testDispersion(sim))
+print(testOutliers(sim, type = "bootstrap"))
+```
+```{r}
+plotResiduals(sim, wasl_num$Subject_Grade)
+```
+```{r}
+plotResiduals(sim, wasl_num$County)
+```
+```{r}
+plotResiduals(sim, droplevels(interaction(wasl_num$County,wasl_num$School)))
+```
+
+```{r}
+par(mfrow = c(2,2))
+ran = ranef(modwm_both_cs)
+qqnorm(ran$County$`(Intercept)`, main = "County Intercept")
+qqline(ran$County$`(Intercept)`)
+qqnorm(ran$`School:County`$`(Intercept)`, main = "County:School Intercept")
+qqline(ran$`School:County`$`(Intercept)`)
+
+qqnorm(ran$`County:Subject_Grade`$`(Intercept)`, main = "Subject_Grade Intercept")
+qqline(ran$`County:Subject_Grade`$`(Intercept)`)
+
+qqnorm(ran$`County:Subject_Grade`$FreeorReducedPricedMeals_logit, main = "%Reduced Price Slope")
+qqline(ran$`County:Subject_Grade`$FreeorReducedPricedMeals_logit)
+```
+
+The uncorrelated random slope improves the model further, but also seems to have gotten us back in trouble in terms of residual variance metrics.. More importantly, does the term make sense? In our EDA, we saw that %reduced cost meals had pretty similar linear fits between grades, counties, and subjects. There was some erratic behavior with math and science for 10th graders, both in terms of direction and magnitude of the slopes, so it isn't shocking that the random slope would improve the model. But why uncorrelated? From a practical standpoint, it makes the model less complicated. But we are concerned with why it made the model 'better'. Perhaps the counties in which we saw improvement in math and/or science with increases in %reduced cost meal plans (and therefore reduced expected scores and a lower intercept) were enough to move the needle. Regardless, with the demographic variables accounted for, we only have the resource variables to investigate.
+
+
+```{r}
+par(mfrow = c(2,2))
+plotResiduals(sim, wasl_num$TotalEnrollment)
+plotResiduals(sim, wasl_num$StudentsPerClassroomTeacher)
+plotResiduals(sim, wasl_num$AvgYearsEducationalExperience)
+plotResiduals(sim, wasl_num$PercentTeachersWithAtLeastMasterDegree)
+```
+
+It looks like there may be a slight effect of total enrollment, and maybe a negligible effect of student:teacher ratio at the high end, but the other two seem to have almost nothing. From our preliminary checks, it looked like it might be worth checking the effect of log(enrollment), so we will try that as well.
+
+```{r}
+wasl_num = wasl_num |>
+  mutate(
+    stratio = scale(StudentsPerClassroomTeacher),
+    mast = scale(PercentTeachersWithAtLeastMasterDegree),
+    exp = scale(AvgYearsEducationalExperience),
+    enroll = scale(TotalEnrollment)
+  )
+
+mod_enroll = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + 
+                    FreeorReducedPricedMeals_logit + PercentWhite_logit + enroll +
+                      (FreeorReducedPricedMeals_logit || County:Subject_Grade) + (1|County/School), 
+                   family = binomial, wasl_num, control = glmerControl(optimizer = "bobyqa"))
+
+mod_log = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + 
+                    FreeorReducedPricedMeals_logit + PercentWhite_logit + log(TotalEnrollment) +
+                      (FreeorReducedPricedMeals_logit || County:Subject_Grade) + (1|County/School), 
+                   family = binomial, wasl_num, control = glmerControl(optimizer = "bobyqa"))
+
+mod_str = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + 
+                    FreeorReducedPricedMeals_logit + PercentWhite_logit + stratio +
+                      (FreeorReducedPricedMeals_logit || County:Subject_Grade) + (1|County/School), 
+                   family = binomial, wasl_num, control = glmerControl(optimizer = "bobyqa"))
+
+mod_stroll = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + 
+                    FreeorReducedPricedMeals_logit + PercentWhite_logit + 
+                     stratio + enroll +
+                      (FreeorReducedPricedMeals_logit || County:Subject_Grade) + 
+                     (1 | County/School), 
+                   family = binomial, wasl_num, control = glmerControl(optimizer = "bobyqa"))
+
+
+mod_stroll_slope = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + 
+                    FreeorReducedPricedMeals_logit + PercentWhite_logit + 
+                     stratio + enroll + (FreeorReducedPricedMeals_logit || County:Subject_Grade) + 
+                     (enroll | County:School) + (1|County), 
+                   family = binomial, wasl_num, control = glmerControl(optimizer = "bobyqa"))
+
+anova(modwm_both_cs, mod_enroll, mod_log, mod_str, mod_stroll, mod_stroll_slope)
+```
+
+Adding enrollment and student:teacher ratio as fixed effects yielded some more good improvements, and adding a random slope for enrollment at the school within county level helped even more. It makes sense that the effect of enrollment could vary between schools within counties. For instance, in a county with a lot of big schools (like where I went to school - Los Angeles County), having tons of students may not mean as much as demographic factors do, and maybe schools with fewer students (like small private schools) will outperform those with more students. However, in a smaller county, there may only be one or two schools with lots of students, and those schools will likely have disproportionate amounts of resources compared to the other small schools in the county, leading to generally better performance. 
+
+(note that using log(enroll) as a fixed effect and the scaled enroll for the random slope actually gave the best BIC, but I didn't think that was a justifiable addition, so I went with this model)
+
+```{r}
+sim = simulateResiduals(mod_stroll_slope)
+plot(sim)
+print(testDispersion(sim))
+
+print(testOutliers(sim, type = "bootstrap"))
+```
+
+```{r}
+plotResiduals(sim, wasl_num$Subject_Grade)
+```
+```{r}
+plotResiduals(sim, wasl_num$County)
+```
+```{r}
+plotResiduals(sim, droplevels(interaction(wasl_num$County,wasl_num$School)))
+```
+
+```{r}
+par(mfrow = c(2,3))
+ran = ranef(mod_stroll_slope)
+qqnorm(ran$County$`(Intercept)`, main = "County Intercept")
+qqline(ran$County$`(Intercept)`)
+qqnorm(ran$`County:School`$`(Intercept)`, main = "County:School Intercept")
+qqline(ran$`County:School`$`(Intercept)`)
+
+qqnorm(ran$`County:Subject_Grade`$`(Intercept)`, main = "Subject_Grade Intercept")
+qqline(ran$`County:Subject_Grade`$`(Intercept)`)
+
+qqnorm(ran$`County:Subject_Grade`$FreeorReducedPricedMeals_logit, main = "%Reduced Price Slope")
+qqline(ran$`County:Subject_Grade`$FreeorReducedPricedMeals_logit)
+
+qqnorm(ran$`County:School`$enroll, main = "Enroll slope")
+qqline(ran$`County:School`$enroll)
+```
+
+With the latest model, we have again cleared the dispersion and outlier hurdles, but our difficulties at the group level persist. One thing I am interested in testing out is whether %white could have a random slope. The plot earlier didn't give much indication of that, but we also couldn't see the grouping factors. Furthermore, our EDA showed that %white seemed to be all over the place between counties and subjects. Let's give it a try.
+
+```{r}
+mod_stroll_wslope = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + 
+                    FreeorReducedPricedMeals_logit + PercentWhite_logit + 
+                     stratio + enroll + (FreeorReducedPricedMeals_logit + PercentWhite_logit || County:Subject_Grade) + 
+                     (enroll | County:School) + (1|County), 
+                   family = binomial, wasl_num, control = glmerControl(optimizer = "bobyqa"))
+
+anova(mod_stroll_slope, mod_stroll_wslope)
+```
+
+```{r}
+sim = simulateResiduals(mod_stroll_wslope)
+plot(sim)
+print(testDispersion(sim))
+
+print(testOutliers(sim, type = "bootstrap"))
+```
+```{r}
+plotResiduals(sim, wasl_num$Subject_Grade)
+```
+```{r}
+plotResiduals(sim, wasl_num$County)
+```
+```{r}
+plotResiduals(sim, droplevels(interaction(wasl_num$County,wasl_num$School)))
+```
+
+```{r}
+ran = ranef(mod_stroll_wslope)
+par(mfrow = c(2,3))
+qqnorm(ran$County$`(Intercept)`, main = "County Intercept")
+qqline(ran$County$`(Intercept)`)
+qqnorm(ran$`County:School`$`(Intercept)`, main = "County:School Intercept")
+qqline(ran$`County:School`$`(Intercept)`)
+
+qqnorm(ran$`County:Subject_Grade`$`(Intercept)`, main = "Subject_Grade Intercept")
+qqline(ran$`County:Subject_Grade`$`(Intercept)`)
+
+qqnorm(ran$`County:Subject_Grade`$FreeorReducedPricedMeals_logit, main = "%Reduced Price Slope")
+qqline(ran$`County:Subject_Grade`$FreeorReducedPricedMeals_logit)
+
+qqnorm(ran$`County:Subject_Grade`$PercentWhite_logit, main = "%White Slope")
+qqline(ran$`County:Subject_Grade`$PercentWhite_logit)
+
+qqnorm(ran$`County:School`$enroll, main = "Enroll slope")
+qqline(ran$`County:School`$enroll)
+```
+
+A whopping one point improvement in BIC! But at least we passed the big 3 DHARMa tests. Now we see if the last two predictors have anything to offer
+
+```{r}
+par(mfrow = c(1,2))
+plotResiduals(sim, wasl_num$AvgYearsEducationalExperience)
+plotResiduals(sim, wasl_num$PercentTeachersWithAtLeastMasterDegree)
+```
+
+It looks like they may be able to contribute a little bit. Worth a try.
+
+```{r}
+mod_exp = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + 
+                    FreeorReducedPricedMeals_logit + PercentWhite_logit + 
+                     stratio + enroll + exp + 
+                  (FreeorReducedPricedMeals_logit + PercentWhite_logit|| County:Subject_Grade) + 
+                     (enroll | County:School) + (1|County), 
+                   family = binomial, wasl_num, control = glmerControl(optimizer = "bobyqa"))
+
+mod_mast = glmer(cbind(MetStandard, TotalTested - MetStandard) ~ Subject_Grade + 
+                    FreeorReducedPricedMeals_logit + PercentWhite_logit + 
+                     stratio + enroll + mast +
+                   (FreeorReducedPricedMeals_logit + PercentWhite_logit|| County:Subject_Grade) + 
+                     (enroll | County:School) + (1|County), 
+                   family = binomial, wasl_num, control = glmerControl(optimizer = "bobyqa"))
+
+anova(mod_stroll_wslope, mod_exp, mod_mast)
+```
+
+They were not able to contribute a little bit. Unfortunately, we are out of variables, and we are stuck with heteroscedasticity in our groups. Though of course that can happen, and shouldn't be shocking given the data we are working with (I think that if we could operate at the district level instead of county level, we would be able to achieve a much better fit).
+
+```{r}
+summary(mod_stroll_wslope)
+```
+The County:School intercept does most of the heavy lifting for the random effects in our model, and is actually very correlated with its random slope `enroll`. This is rather concerning, but I think my rationale for including that term is sufficient to keep it as is. The County intercept accounts for the next-most variability. This is rather unsurprising; recall the massive jumps in BIC we saw in the initial models. We see a similar phenomenon in the fixed effects, with the various Subject_Grade combinations almost all having higher estimates than the remaining fixed effects. Back to the random effects though, the %white slope term is not doing much work in this model. Though it improved our BIC (by 1), this is probably the first term I would consider removing. However, the miniscule improvements it gave us also led to lower residual variance and fewer outliers. 
+
+## Outlier Analysis
+
+Now let's examine the outliers to find our over- and underperforming schools, and perhaps any patterns they may follow.
+
+```{r, message = FALSE}
+res = residuals(mod_stroll_wslope, type = "deviance")
+fits = fitted(mod_stroll)
+lb = quantile(res, .025)
+ub = quantile(res, .975)
+
+wasl_num$fit = fits
+wasl_num$res = res
+outliers_df = wasl_num[which(abs(res) > 2),]
+
+outliers_df = outliers_df |>
+  mutate(
+    Performance = case_when(res < 0 ~ "Under", res > 0 ~ "Over")
+  )
+
+ggpairs(outliers_df,
+        columns = c("FreeorReducedPricedMeals", "PercentWhite", "StudentsPerClassroomTeacher", 
+                    "PropPassed", "TotalEnrollment", "TotalTested",
+                    "PercentTeachersWithAtLeastMasterDegree", "AvgYearsEducationalExperience"),
+        diag = list(continuous = wrap("densityDiag", alpha = 0.5)),
+        aes(color = Performance))
+```
+
+There is not much of a visibly discernible difference between any of ther variables for the outliers (except for `PropPassed`, which is to be expected). Let's see if there's anything at the subject level.
+
+```{r}
+ggplot(outliers_df, aes(x = PropPassed, y = res, color = PercentWhite, pch = GradeTested)) +
+  geom_point(size = 2)+
+  facet_wrap(.~Subject)
+```
+All that we have here is that math and writing yield the fewest outliers, reading has the most on the higher end, and science on the lower end. This is ostensibly the same as what we saw with `prop` above, given the trends in scores for each subject (and the sample size in the case of writing). Let's look at which schools had the highest over- and lowest underperformances.
+
+
+```{r}
+library(knitr)
+top_overperformers = outliers_df |>
+  arrange(desc(res)) |>
+  slice_head(n = 10) |>
+  select(School, County, Subject, GradeTested, TotalTested, fit, PropPassed, res) |>
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+
+top_underperformers = outliers_df |>
+  arrange(res) |>  
+  slice_head(n = 10) |>  
+  select(School, County, Subject, GradeTested, TotalTested, fit, PropPassed, res) |>
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+
+kable(top_overperformers, format = "markdown", col.names = c("School",  "County", "Subject", "Grade", "Total Tested", "Fitted", "Observed", "Residual"))
+```
+```{r}
+kable(top_underperformers, format = "markdown", col.names = c("School",  "County", "Subject", "Grade", "Total Tested", "Fitted", "Observed", "Residual"))
+```
+
+We notice that the extreme outliers are usually either cases in which the model was unable to predict extremely low scores (close to 0 or 1), or schools with huge samples that the model missed by non-trivial amounts (or Kalama Jr Sr High, which for some reason our model just predicted way off on what were pretty moderate outomes)
+
+```{r}
+length(unique(outliers_df$School))
+school_counts = outliers_df |>
+  group_by(County, School) |>
+  summarize(Count = n(), .groups = "drop")
+
+duplicate_outliers = school_counts |>
+  filter(Count > 1) |>
+  pull(School)
+
+multi_outliers = outliers_df |>
+  filter(School %in% duplicate_outliers)
+
+consistent_outliers = multi_outliers |>
+  group_by(School) |>
+  filter(all(res > 2) | all(res < -2)) |>
+  ungroup()
+```
+
+Interestingly, no schools were outliers for two different grade levels, and Medical Lake High School's 10th grade class was the only outlier in more than two subjects (Reading+, Writing+, Science-). Even more interestingly, although there were 33 schools who were outliers for two subjects, only two schools were outliers of the same type (i.e. overperformed in all subjects or underperformed in all subjects). 
+
+
+```{r}
+consistent_outliers |>
+  select(County, School, Subject, TotalTested, fit, PropPassed, res) |>
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+```
+
+Though having multiple outlier scores is impressive, it isn't necessarily the best indication of overall unexpected performance. Let's find the schools who had the highest and lowest average residuals.
+
+```{r}
+sum_res = wasl_num |>
+  group_by(School, GradeTested, County) |>
+  summarize(
+    mean_res = sum(res, na.rm = TRUE) / ifelse(unique(GradeTested) == 5, 3, 4),
+    .groups = "drop"
+  )
+
+sum_plus = sum_res |>
+  filter(mean_res > 0) |>
+  arrange(desc(mean_res)) |> 
+  slice_head(n = 5) # Used AI to get this function
+
+sum_minus = sum_res |>
+  filter(mean_res < 0) |>
+  arrange(mean_res) |> 
+  slice_head(n = 5)
+
+kable(sum_plus, format = "markdown", col.names = c("School",  "Grade", "County", "Mean Residual"))
+```
+```{r}
+kable(sum_minus, format = "markdown", col.names = c("School",  "Grade", "County", "Mean Residual"))
+```
+
+We see from this that Lowell Elementary School is a cut above the rest, and Clallam Bay High School (funnily enough their 5th grade class slightly underperformed in all subjects) is a cut above the rest of the rest! Both noticeably outperform the rest of the schools at 'defeating' our model. However, it is reassuring to see that no schools were particularly close to being outliers in all subjects on average, and the 'extreme' averages on the negative side are especially nice to see. I think that it's just because even the most severely underperforming schools still have pass rates at or above 1/6 in reading and writing, which helps the model because it has difficulty predicting too close to 0% or 100%. I suppose it is also reassuring to me as an aspiring educator to see that the model has more trouble at the higher end because pass rates tend to be closer to 100% more often than they are to 0%.
+
+# Conclusions/Further Work
+
+I ran a model selection process based on working my way 'down' the hierarchy of the data, starting with county, subject, school, and proceeding from there. I used a combination of intuition and my previous visual exploration of the data to come up with models to test, and evaluated them based on BIC and intuitive plausibility. I then examined model assumptions using DHARMa to generate plots and conduct various tests of the model's fit/residual variance at different levels. 
+
+I found demographic factors (%white, %reduced cost meals) able to explain more variance in performance compared to school-resource-factors (enrollment, student:teacher ratio). Most interestingly, I found that schools with higher proportions of teacher's with master's degrees and more experienced teachers did not see any meaningful improvements in performance. The latter makes sense to some extent: there has always been the stereotype of the old teacher stuck in their ways who students accustomed to more modern methods of teaching have trouble learning from. It's a little saddening to see that borne out in the model, but I also shouldn't give my model too much credit here. These conclusions are certainly not...conclusive. From the very beginning, I made a decision to generally remove any rows with `NA` entries, except for those I felt certain I could discern the true value of. 70 or so rows may not be enough to change too much, but it would be interesting to try doing some kind of imputation to see if we could get decent estimates for some of those missing values. Or perhaps we could see if the data is online somewhere (I actually did this, but I didn't look very hard). 
+
+A second, and more consequential, shortcoming of my procedure came in my model selection. I think I was very lenient in terms of allowing myself to induce further variance within my grouping factors, writing it off as something that was unavoidable given the nature of the data. Not that I don't believe that to be true, but I also believe that there were ways it could have been mitigated. Perhaps not being so quick to add the School:County intercept, or the grouping of grade and subject. I could have chosen to completely disregard the writing test; having data on three subjects across two grade levels could have helped a lot (this was my initial approach but I convinced myself that it would not be received well for whatever reason).
+
+A further issue with my model selection was my approach to variable selection. I think that the order I went in made sense and was totally reasonable, but I worry that I had too much of a one-track mind with exclusively using BIC to choose how to proceed. I don't think BIC is or was a bad metric to use, and my approach may turn out to have been the best one. But I think I should have done some further investigation into the merits of other approaches to model selection. In fact, I literally just finished a project on random jump Markov chain Monte Carlo, which is a tool that might have been great for this (probably too slow though). That's something I may look into over winter break.
+
+```{r}
+#knitr::purl("STA 610 Final Analysis.Rmd", output = "analysis_code.R", documentation = 0)
+```
+

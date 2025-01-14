@@ -1,0 +1,1820 @@
+---
+title: "STA 571 Final Project"
+author: "John Gillen"
+date: "2024-11-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message = F, warning = F}
+library(mixAK)
+library(distr)
+library(miscF)
+library(coda)
+library(MCMCprecision)
+library(ggplot2)
+library(ggridges)
+library(mixtools)
+library(AdaptGauss)
+library(bayesmix)
+library(reshape2)
+library(clue)
+library(transport)
+library(bayestestR)
+library(posterior)
+library(dplyr)
+library(boot)
+set.seed(14727)
+k = 6
+means = runif(k, -25, 25)
+vars = runif(k, .75, 12)
+ws = rdirichlet(1, rep(2,k))
+
+data = rnormmix(250, ws, means, sqrt(vars))
+hist(data, breaks = 50)
+
+gen_data = function(k, ws, means, vars, n) {
+  mu = runif(k, means[1], means[2])
+  s2 = runif(k, vars[1], vars[2])
+  weights = ws
+  return(rnormmix(n, weights, mu, sqrt(s2)))
+}
+```
+
+```{r}
+data(fish)
+y = fish[,1]
+prior_ws = rep(1, 1)
+prior_k = 1
+prior_mu = rep(mean(y),1)
+prior_sds = rep(sd(y), prior_k)
+n_sims = 10000
+Z <- do.call(cbind, lapply(1:prior_k, function(i)
+                                    prior_ws[i]*dnorm(y, prior_mu[i], prior_sds[i])))
+Z <- apply(Z, 1, function(x) which(x==max(x))[1])
+
+burn_in = 500
+
+vectorize <- function(param_list) {
+  lapply(param_list, function(param) {
+    if (is.matrix(param)) {
+      as.vector(param)
+    } 
+    else {
+      param 
+    }
+  })
+}
+```
+
+```{r}
+# rjmcmc_density_classification(data, 1000, prior_ws, prior_mu, prior_sds^2, 1, 7, em = F, 0, F)
+```
+
+## Relabel means, extract posterior, plot ridgeline posterior
+```{r}
+relabel_means <- function(means_samples, weights_samples = NULL) {
+  n_sims <- nrow(means_samples)
+  k <- ncol(means_samples)
+  reference_means <- colMeans(means_samples)
+  
+  relabeled_means <- matrix(NA, nrow = n_sims, ncol = k)
+  
+  for (i in 1:n_sims) {
+    current_means <- means_samples[i, ]
+    
+    cost_matrix <- outer(current_means, reference_means, function(x, y) abs(x - y))
+    cost_matrix <- cost_matrix + diag(k)*0.15
+    assignment <- solve_LSAP(cost_matrix, maximum = FALSE)
+    
+    relabeled_means[i, ] <- current_means[assignment]
+  }
+  
+  relabeled_weights <- NULL
+  if (!is.null(weights_samples)) {
+    relabeled_weights <- matrix(NA, nrow = n_sims, ncol = k)
+    for (i in 1:n_sims) {
+      current_weights <- weights_samples[i, ]
+      relabeled_weights[i, ] <- current_weights[assignment]
+    }
+  }
+  
+  list(relabeled_means = relabeled_means, relabeled_weights = relabeled_weights)
+}
+
+extract_posterior <- function(fit, burn_in, threshold = 0.01) {
+  if (!is.null(fit$k.save)) {
+    k_samples <- fit$k.save[-(1:burn_in)]
+    weights_samples <- fit$w.save[-(1:burn_in)]
+    means_samples <- fit$mu.save[-(1:burn_in)]
+    variances_samples <- fit$sigma2.save[-(1:burn_in)]
+    
+    k_table <- sort(table(k_samples), decreasing = TRUE)
+    k_prob <- k_table / sum(k_table)
+    
+    top_k <- as.integer(names(k_prob)[1:2])
+    prob_diff <- abs(k_prob[1] - k_prob[2])
+    
+    if (length(top_k) > 1 && abs(top_k[1] - top_k[2]) == 1 && prob_diff <= threshold) {
+      most_probable_k <- min(top_k)
+    } else {
+      most_probable_k <- as.integer(names(k_prob)[1])
+    }
+    
+    indices <- which(k_samples == most_probable_k)
+    posterior_weights <- do.call(rbind, lapply(weights_samples[indices], unlist))
+    posterior_means <- do.call(rbind, lapply(means_samples[indices], unlist))
+    posterior_variances <- do.call(rbind, lapply(variances_samples[indices], unlist))
+    
+    list(
+      most_probable_k = most_probable_k,
+      weights = posterior_weights,
+      means = posterior_means,
+      variances = posterior_variances
+    )
+  } else {
+    weights_samples <- fit$w.save[-(1:burn_in)]
+    means_samples <- fit$mu.save[-(1:burn_in)]
+    variances_samples <- fit$sigma2.save[-(1:burn_in)]
+    
+    posterior_weights <- do.call(rbind, lapply(weights_samples, unlist))
+    posterior_means <- do.call(rbind, lapply(means_samples, unlist))
+    posterior_variances <- do.call(rbind, lapply(variances_samples, unlist))
+    
+    fixed_k <- ncol(posterior_weights)
+    
+    list(
+      most_probable_k = fixed_k,
+      weights = posterior_weights,
+      means = posterior_means,
+      variances = posterior_variances
+    )
+  }
+}
+
+plot_ridgeline_posterior <- function(posterior, parameter_name, true_values = NULL, method) {
+  samples <- posterior[[parameter_name]]
+  num_components <- ncol(samples)
+  
+  df <- do.call(rbind, lapply(1:num_components, function(i) {
+    data.frame(
+      value = samples[, i],
+      component = factor(paste(parameter_name, i))
+    )
+  }))
+  
+  lower_bound <- min(apply(samples, 2, function(x) quantile(x, 0.05)))
+  upper_bound <- max(apply(samples, 2, function(x) quantile(x, 0.95)))
+  
+  p <- ggplot(df, aes(x = value, y = component, fill = component)) +
+    geom_density_ridges(alpha = 0.7, scale = 1.5) +
+    scale_x_continuous(limits = c(lower_bound, upper_bound)) +
+    labs(title = paste(method, parameter_name, "(90%, k =", posterior$most_probable_k, ")"),
+         x = parameter_name, y = "Component") +
+    theme_ridges() +
+    theme(legend.position = "none")
+  
+  if (!is.null(true_values)) {
+    for (true_value in true_values) {
+      p <- p + 
+        geom_vline(xintercept = true_value, linetype = "dashed", size = 0.6, color = "black")
+    }
+  }
+  
+  return(p)
+}
+plot_ridgeline_posterior <- function(posterior, parameter_name, true_values = NULL, method) {
+  samples <- posterior[[parameter_name]]
+  num_components <- ncol(samples)
+  
+  # Create a data frame combining all components
+  df <- do.call(rbind, lapply(1:num_components, function(i) {
+    data.frame(
+      value = samples[, i],
+      component = factor(paste(parameter_name, i))
+    )
+  }))
+  
+  # Calculate 95% limits for x-axis
+  lower_bound <- min(apply(samples, 2, function(x) quantile(x, 0.025)))
+  upper_bound <- max(apply(samples, 2, function(x) quantile(x, 0.975)))
+  
+  # Plot
+  p <- ggplot(df, aes(x = value, fill = component)) +
+    geom_density(alpha = 0.7, position = "identity") + # Overlapping densities
+    scale_x_continuous(limits = c(lower_bound, upper_bound)) +
+    labs(
+      title = paste(method, parameter_name, "(95%, k =", posterior$most_probable_k, ")"),
+      x = parameter_name,
+      y = "Density"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none") # Show legend for components
+  
+  # Add true values if provided
+  if (!is.null(true_values)) {
+    for (true_value in true_values) {
+      p <- p + 
+        geom_vline(xintercept = true_value, linetype = "dashed", size = 1.2, color = "black")
+    }
+  }
+  
+  return(p)
+}
+
+```
+
+## Gibbs
+```{r}
+gibbs_gmm <- function(data, k, n_sims, alpha = 1, mu_prior = mean(data), tau2_prior = 100, a_prior = 1, b_prior = 1) {
+  n <- length(data)
+  Z <- sample(1:k, n, replace = TRUE)
+  weights <- rep(1 / k, k)
+  means <- rnorm(k, mu_prior, sd(data))
+  variances <- rep(var(data), k)
+  
+  w_save <- vector("list", n_sims)
+  mu_save <- vector("list", n_sims)
+  sigma2_save <- vector("list", n_sims)
+  Z_save <- matrix(0, nrow = n, ncol = n_sims)
+  
+  for (iter in 1:n_sims) {
+    Z_prob <- sapply(1:k, function(j) {
+      if (variances[j] <= 0 || is.na(variances[j]) || is.na(means[j])) {
+        rep(0, length(data))
+      } else {
+        weights[j] * dnorm(data, mean = means[j], sd = sqrt(variances[j]))
+      }
+    })
+    
+    Z_prob[is.na(Z_prob)] <- 0
+    row_sums <- rowSums(Z_prob)
+    row_sums[is.na(row_sums) | is.nan(row_sums)] <- 0
+    
+    if (any(row_sums == 0)) {
+      Z_prob[row_sums == 0, ] <- 1 / k
+    } else {
+      Z_prob <- Z_prob / row_sums
+    }
+    
+    Z <- apply(Z_prob, 1, function(p) sample(1:k, 1, prob = p))
+    
+    weights <- as.numeric(rdirichlet(1, alpha + table(factor(Z, levels = 1:k))))
+    
+    for (j in 1:k) {
+      n_j <- sum(Z == j)
+      data_j <- data[Z == j]
+      
+      if (n_j > 0) {
+        tau2_post <- 1 / (1 / tau2_prior + n_j / max(variances[j], 1e-6))
+        mu_post <- tau2_post * (mu_prior / tau2_prior + sum(data_j) / max(variances[j], 1e-6))
+        means[j] <- rnorm(1, mu_post, sqrt(tau2_post))
+      } else {
+        means[j] <- rnorm(1, mu_prior, sqrt(tau2_prior))
+      }
+    }
+    
+    for (j in 1:k) {
+      n_j <- sum(Z == j)
+      data_j <- data[Z == j]
+      
+      if (n_j > 0) {
+        a_post <- a_prior + n_j / 2
+        b_post <- b_prior + sum((data_j - means[j])^2) / 2
+        variances[j] <- 1 / rgamma(1, a_post, rate = b_post)
+      } else {
+        variances[j] <- var(data)
+      }
+      
+      if (variances[j] <= 0 || is.na(variances[j]) || is.nan(variances[j])) {
+        variances[j] <- var(data)
+      }
+    }
+  
+    w_save[[iter]] <- weights
+    mu_save[[iter]] <- means
+    sigma2_save[[iter]] <- variances
+    Z_save[, iter] <- Z
+  }
+  
+  list(
+    w.save = w_save,
+    mu.save = mu_save,
+    sigma2.save = sigma2_save,
+    Z.save = Z_save
+  )
+}
+
+```
+
+## MH
+```{r}
+mh_gmm <- function(data, k, n_sims, proposal_sd = 0.5, alpha = 1,
+                   mu_prior = mean(data), tau2_prior = 100, a_prior = 1, b_prior = 1) {
+  n <- length(data)
+  Z <- sample(1:k, n, replace = TRUE)
+  weights <- rep(1 / k, k)
+  means <- rnorm(k, mean(data), sd(data))
+  variances <- rep(var(data), k)
+
+  w_save <- vector("list", n_sims)
+  mu_save <- vector("list", n_sims)
+  sigma2_save <- vector("list", n_sims)
+  Z_save <- matrix(0, nrow = n, ncol = n_sims)
+
+  for (iter in 1:n_sims) {
+    Z_prob <- sapply(1:k, function(j) {
+      weights[j] * dnorm(data, mean = means[j], sd = sqrt(variances[j]))
+    })
+    Z_prob <- Z_prob / rowSums(Z_prob)
+    Z <- apply(Z_prob, 1, function(p) sample(1:k, 1, prob = p))
+
+    weights <- as.numeric(rdirichlet(1, alpha + table(factor(Z, levels = 1:k))))
+
+    for (j in 1:k) {
+      current_mean <- means[j]
+      proposed_mean <- rnorm(1, mean = current_mean, sd = proposal_sd)
+
+      log_prior_ratio <- dnorm(proposed_mean, mu_prior, sqrt(tau2_prior), log = TRUE) -
+                         dnorm(current_mean, mu_prior, sqrt(tau2_prior), log = TRUE)
+
+      log_likelihood_current <- sum(dnorm(data[Z == j], mean = current_mean, sd = sqrt(variances[j]), log = TRUE))
+      log_likelihood_proposed <- sum(dnorm(data[Z == j], mean = proposed_mean, sd = sqrt(variances[j]), log = TRUE))
+      log_likelihood_ratio <- log_likelihood_proposed - log_likelihood_current
+
+      log_acceptance_ratio <- log_prior_ratio + log_likelihood_ratio
+
+      if (!is.na(log_acceptance_ratio) && log(runif(1)) < log_acceptance_ratio) {
+        means[j] <- proposed_mean
+        }
+    }
+
+    for (j in 1:k) {
+      current_variance <- variances[j]
+      proposed_variance <- abs(rnorm(1, mean = current_variance, sd = proposal_sd))
+
+      log_prior_ratio <- dgamma(1 / proposed_variance, a_prior, rate = b_prior, log = TRUE) -
+                         dgamma(1 / current_variance, a_prior, rate = b_prior, log = TRUE)
+
+      log_likelihood_current <- sum(dnorm(data[Z == j], mean = means[j], 
+                                          sd = sqrt(current_variance), log = TRUE))
+      log_likelihood_proposed <- sum(dnorm(data[Z == j], mean = means[j], 
+                                           sd = sqrt(proposed_variance), log = TRUE))
+      
+      log_likelihood_ratio <- log_likelihood_proposed - log_likelihood_current
+      log_acceptance_ratio <- log_prior_ratio + log_likelihood_ratio
+
+      if (log(runif(1)) < log_acceptance_ratio) {
+        variances[j] <- proposed_variance
+      }
+    }
+
+    # to deal with label switching
+    sorted_indices <- order(means)
+    means <- means[sorted_indices]
+    variances <- variances[sorted_indices]
+    weights <- weights[sorted_indices]
+
+    w_save[[iter]] <- weights
+    mu_save[[iter]] <- means
+    sigma2_save[[iter]] <- variances
+    Z_save[, iter] <- Z
+  }
+
+  list(
+    w.save = w_save,
+    mu.save = mu_save,
+    sigma2.save = sigma2_save,
+    Z.save = Z_save
+  )
+}
+
+```
+
+## Posterior Predictive
+```{r}
+generate_posterior_predictive <- function(post, n_samples = 500, data_size = 100, fixed_k = T) {
+  if (fixed_k) {
+    weights <- post$weights
+    means <- post$means
+    variances <- post$variances
+    n_sims <- nrow(weights) 
+  } 
+  else {
+    k_samples <- post$k.save
+    weights <- post$w.save
+    means <- post$mu.save
+    variances <- post$sigma2.save
+    n_sims <- length(k_samples)
+  }
+  y_new <- numeric(0)
+  
+  for (i in 1:n_samples) {
+    idx <- sample(1:n_sims, 1)
+    
+    if (fixed_k) {
+      w <- weights[idx, ]
+      mu <- means[idx, ]
+      sigma <- sqrt(variances[idx, ])
+    } 
+    else {
+      k <- k_samples[idx]
+      w <- unlist(weights[[idx]])
+      mu <- unlist(means[[idx]])
+      sigma <- sqrt(unlist(variances[[idx]]))
+      
+      w <- w[1:k]
+      mu <- mu[1:k]
+      sigma <- sigma[1:k]
+    }
+    z <- sample(1:length(w), size = data_size, replace = TRUE, prob = w)
+    y_new <- c(y_new, rnorm(data_size, mean = mu[z], sd = sigma[z]))
+  }
+  y_new
+}
+```
+## rj_gibbs_mh
+```{r}
+burn_in = 500
+
+rj_gibbs_mh <- function(data, n_sims, max_k, k, prop_sd = 0.5, alpha = 1, mu0 = mean(data), t20 = 100, a0 = 1, b0 = 1, burn_in = 100, relabel = F) {
+  prior_ws = c(1)
+  prior_mu = c(mean(data))
+  prior_sds = c(sqrt(range(data)[2] - range(data)[1]))
+  prior_k = 1
+  Z <- do.call(cbind, lapply(1:prior_k, function(i)
+                                    prior_ws[i]*dnorm(data, prior_mu[i], prior_sds[i])))
+  Z <- apply(Z, 1, function(x) which(x==max(x))[1])
+  
+  rj = uvnm.rjmcmc(data, n_sims, max_k, prior_k, prior_ws, prior_mu, c(range(data)[2] - range(data)[1]), Z, verbose = F)
+  rj_post = extract_posterior(rj, burn_in)
+  
+  gibbs = gibbs_gmm(data, k, n_sims, alpha, mu0, t20, a0, b0)
+  gibbs_post = extract_posterior(gibbs, burn_in)
+  
+  mh = mh_gmm(data, k, n_sims, prop_sd, alpha, mu0, t20, a0, b0)
+  mh_post = extract_posterior(mh, burn_in)
+  
+  if (relabel == T) {
+    rj_relabels = relabel_means(rj_post$means, rj_post$weights)
+    rj_post$means = rj_relabels$relabeled_means
+    rj_post$weights = rj_relabels$relabeled_weights
+    
+    gibbs_relabels = relabel_means(gibbs_post$means, gibbs_post$weights)
+    gibbs_post$means = gibbs_relabels$relabeled_means
+    gibbs_post$weights = gibbs_relabels$relabeled_weights
+    
+    mh_relabels = relabel_means(mh_post$means, mh_post$weights)
+    mh_post$means = mh_relabels$relabeled_means
+    mh_post$weights = mh_relabels$relabeled_weights
+  }
+    out = list(
+      rj = rj,
+      rj_post = rj_post,
+      gibbs = gibbs,
+      gibbs_post = gibbs_post,
+      mh = mh,
+      mh_post = mh_post
+    )
+    return(out)
+}
+data(Galaxy)
+g = Galaxy
+```
+
+```{r, warning = FALSE}
+n_sims <- 10000
+burn_in <- 100
+k <- 4 
+
+mh_chains <- list()
+gibbs_chains <- list()
+
+for (i in 1:4) {
+  mh_chains[[i]] <- mh_gmm(g, k, n_sims)
+  gibbs_chains[[i]] <- gibbs_gmm(g, k, n_sims)
+}
+
+
+compute_rhat <- function(chains) {
+  m <- length(chains)
+  n <- nrow(chains[[1]])
+  p <- ncol(chains[[1]])
+  
+  chains_array <- array(unlist(chains), dim = c(n, p, m))
+  chain_means <- apply(chains_array, c(2, 3), mean) 
+  overall_means <- rowMeans(chain_means)  # [parameters]
+  
+  B <- (n / (m - 1)) * (chain_means - overall_means) %*% t(chain_means - overall_means)
+  
+  W <- Reduce(`+`, lapply(1:m, function(k) {
+    chain_k <- chains[[k]]  
+    cov(chain_k)
+  })) / m
+  
+  V_hat <- ((n - 1) / n) * W + (1 / n) * B
+  R_hat <- sqrt(max(eigen(V_hat)$values) / max(eigen(W)$values))
+  
+  return(R_hat)
+}
+
+rhat_over_time <- function(chains) {
+  n <- nrow(chains[[1]])
+  p <- ncol(chains[[1]])
+  rhat_values <- matrix(NA, nrow = n, ncol = p)
+  
+  for (t in 2:n) {
+    start_idx <- max(1, ceiling(t/2))
+    subset_chains <- lapply(chains, function(chain) chain[start_idx:t, ])
+    rhat_values[t, ] <- compute_rhat(subset_chains)
+  }
+  
+  aggregated_rhat <- apply(rhat_values, 1, max, na.rm = TRUE)
+  return(list(rhat_matrix = rhat_values, aggregated_rhat = aggregated_rhat))
+}
+
+
+plot_rhat <- function(rhat_values, method) {
+  rhat_df <- data.frame(Iteration = 1:length(rhat_values), R_hat = rhat_values)
+  p = ggplot(rhat_df, aes(x = Iteration, y = R_hat)) +
+    geom_line(color = "blue") +
+    geom_hline(yintercept = 1.05, linetype = "dashed", color = "red") +
+    labs(title = paste("Max R-hat Over Time (", method, ")"), x = "Iteration", y = "R-hat") +
+    ylim(1,3) +
+    theme_minimal()
+  return(p)
+}
+
+mh_means <- lapply(mh_chains, function(chain) {
+  do.call(rbind, lapply(chain$mu.save, unlist))
+})
+
+gibbs_means <- lapply(gibbs_chains, function(chain) {
+  do.call(rbind, lapply(chain$mu.save, unlist))
+})
+
+rhat_mh <- rhat_over_time(mh_means)
+rhat_gibbs <- rhat_over_time(gibbs_means)
+p_mh <- plot_rhat(rhat_mh$aggregated_rhat[-1], method = "MH")
+p_gibbs <- plot_rhat(rhat_gibbs$aggregated_rhat[-1], method = "Gibbs")
+
+print(p_mh)
+print(p_gibbs)
+```
+
+## R-hat for MH/Gibbs
+```{r, warning = FALSE}
+set.seed(14727)
+combine_chains <- function(mh_chains) {
+  # Iterate over each chain
+  chain_matrices <- lapply(mh_chains, function(chain) {
+    cbind(
+      do.call(rbind, chain$w.save),      # Combine w.save into a matrix
+      do.call(rbind, chain$mu.save),    # Combine mu.save into a matrix
+      do.call(rbind, chain$sigma2.save) # Combine sigma2.save into a matrix
+    )
+  })
+  
+  # Ensure all chains have the same number of iterations and parameters
+  iterations <- nrow(chain_matrices[[1]])
+  n_chains <- length(chain_matrices)
+  n_parameters <- ncol(chain_matrices[[1]])
+  
+  # Convert to a 3D array: [iterations, chains, parameters]
+  chains_array <- array(
+    unlist(chain_matrices),
+    dim = c(iterations, n_chains, n_parameters)
+  )
+  
+  return(chains_array)
+}
+
+compute_multivariate_rhat_over_time <- function(chains_array) {
+  n_iters <- dim(chains_array)[1]  # Total number of iterations
+  rhat_values <- numeric(n_iters)  # To store R-hat values over iterations
+
+  for (i in 2:n_iters) {
+    subset_chains <- chains_array[1:i, , ]
+
+    W <- matrix(0, dim(chains_array)[3], dim(chains_array)[3])
+    for (chain in 1:dim(subset_chains)[2]) {
+      W <- W + cov(subset_chains[, chain, ])
+    }
+    W <- W / dim(subset_chains)[2]  # Average across chains
+
+    chain_means <- apply(subset_chains, c(2, 3), mean)  # Means per chain, per parameter
+    overall_mean <- colMeans(chain_means)  # Overall mean across chains
+    B <- i * cov(chain_means)
+    V_hat <- ((i - 1) / i) * W + (1 / i) * B
+
+    rhat_values[i] <- sqrt(mean(eigen(V_hat)$values) / mean(eigen(W)$values))
+  }
+
+  return(rhat_values)
+}
+
+
+chains_array <- combine_chains(mh_chains)
+start = Sys.time()
+rhat_values <- compute_multivariate_rhat_over_time(chains_array)
+end = Sys.time()
+round(end - start, 2)
+
+rhat_df <- data.frame(
+  Iteration = 2:length(rhat_values),
+  R_hat = rhat_values[-1]
+)
+
+ggplot(rhat_df, aes(x = Iteration, y = R_hat)) +
+  geom_line(color = "blue") +
+  geom_hline(yintercept = 1.05, linetype = "dashed", color = "red") +
+  labs(
+    title = "Multivariate R-hat Over Time (MH)",
+    x = "Iteration",
+    y = "R-hat"
+  ) +
+  ylim(1, 3.5) +
+  theme_minimal()
+```
+
+## PSRFv for RJ
+```{r, warning = FALSE}
+set.seed(14727)
+
+generate_reference_points <- function(fits, points_per_chain) {
+  reference_points_groups <- lapply(points_per_chain, function(n_points) {
+    reference_points_list <- lapply(fits, function(fit) {
+      selected_iters <- sample(1:length(fit$w.save), n_points, replace = TRUE)
+      weights <- unlist(lapply(fit$w.save[selected_iters], mean))
+      means <- unlist(lapply(fit$mu.save[selected_iters], mean))
+      variances <- unlist(lapply(fit$sigma2.save[selected_iters], mean))
+
+      data.frame(weight = weights, mean = means, variance = variances)
+    })
+    do.call(rbind, reference_points_list)
+  })
+
+  return(reference_points_groups)
+}
+
+generate_psrfv_data <- function(points_per_chain, fits) {
+  fits <- lapply(fits, function(fit) {
+    fit$w.save <- vectorize(fit$w.save)
+    fit$mu.save <- vectorize(fit$mu.save)
+    fit$sigma2.save <- vectorize(fit$sigma2.save)
+    return(fit)
+  })
+  
+  reference_points_groups <- generate_reference_points(fits, points_per_chain)
+
+  calculate_combined_distances <- function(iter, ref_points, weights, means, variances) {
+    params_iter <- data.frame(
+      weight = weights[[iter]],
+      mean = means[[iter]],
+      variance = variances[[iter]]
+    )
+
+    ecdf_weight <- ecdf(params_iter$weight)
+    ecdf_mean <- ecdf(params_iter$mean)
+    ecdf_variance <- ecdf(params_iter$variance)
+    
+    sapply(1:nrow(ref_points), function(i) {
+      ref <- ref_points[i,]
+      dist_weight <- abs(ecdf_weight(ref$weight) - ecdf_weight(params_iter$weight))
+      dist_mean <- abs(ecdf_mean(ref$mean) - ecdf_mean(params_iter$mean))
+      dist_variance <- abs(ecdf_variance(ref$variance) - ecdf_variance(params_iter$variance))
+    
+      sqrt((dist_weight^2) * 1 + (dist_mean^2) * 1 + (dist_variance^2) * 1)
+      })
+    }
+
+  get_combined_dist <- function(fit, ref_points) {
+    lapply(1:length(fit$w.save), function(iter) {
+      calculate_combined_distances(iter, ref_points, fit$w.save, fit$mu.save, fit$sigma2.save)
+      })
+    }
+
+  integral_approx <- function(all_distances) {
+    sapply(all_distances, function(distances) {
+      mean(distances) # Or median(distances), depending on your needs
+      })
+    }
+
+  compute_psrfv_partial <- function(integral_approx_fits) {
+    C <- length(integral_approx_fits)
+    N <- length(integral_approx_fits[[1]])
+    psrfv_values <- numeric(N - 1)
+    for (i in 2:N) {
+      start_idx <- max(1, ceiling(i / 2))
+      subset_chains <- lapply(integral_approx_fits, function(chain) chain[1:i])
+      within_variances <- sapply(subset_chains, function(chain) var(chain[start_idx:i]))
+      W_v <- mean(within_variances, na.rm = TRUE)
+      chain_means <- sapply(subset_chains, function(chain) mean(chain, na.rm = TRUE))
+      overall_mean <- mean(chain_means, na.rm = TRUE)
+      B_v <- i * sum((chain_means - overall_mean)^2) / (C - 1)
+      psrfv_values[i - 1] <- sqrt(((i - 1) / i * W_v + B_v / i) / W_v)
+    }
+    return(psrfv_values)
+  }
+
+  psrfv_results <- list()
+  for (i in seq_along(reference_points_groups)) {
+    reference_points <- reference_points_groups[[i]]
+    all_distances <- lapply(fits, function(fit) get_combined_dist(fit, reference_points))
+
+    integral_approx_fits <- lapply(all_distances, integral_approx)
+
+    psrfv_results[[as.character(points_per_chain[i])]] <- compute_psrfv_partial(integral_approx_fits)
+  }
+
+  psrfv_plot_data <- data.frame()
+  for (num_points in names(psrfv_results)) {
+    psrfv_plot_data <- rbind(
+      psrfv_plot_data,
+      data.frame(
+        Iteration = 1:(length(psrfv_results[[num_points]])),
+        PSRFv = psrfv_results[[num_points]],
+        NumPoints = as.factor(num_points)
+      )
+    )
+  }
+  return(psrfv_plot_data)
+}
+
+prior_ws = rep(1, 1)
+prior_k = 1
+prior_mu = rep(mean(g),1)
+prior_sds = rep(sd(g), prior_k)
+n_sims = 10000
+Z <- do.call(cbind, lapply(1:prior_k, function(i)
+                                    prior_ws[i]*dnorm(g, prior_mu[i], prior_sds[i])))
+Z <- apply(Z, 1, function(x) which(x==max(x))[1])
+
+# rj_chains = list()
+# for (i in 1:4) {
+#   rj_chains[[i]] = uvnm.rjmcmc(g, n_sims, 7, prior_k, w = prior_ws, mu = prior_mu, sigma2 = prior_sds^2, Z, verbose = F)
+# }
+# 
+# points_per_chain <- c(1, 5, 13, 25)
+# rj_psrfv = generate_psrfv_data(points_per_chain, rj_chains)
+```
+
+## Analyze Chains
+```{r}
+analyze_chains <- function(data, k, n_sims = 10000, n_chains = 4, points_per_chain = 25, prior_k = 1, prior_ws = c(1), burn_in = 100, relabel = F, mv = T, name = NULL) {
+  prior_mu = mean(data)
+  prior_sds = sqrt(range(data))
+  Z <- do.call(cbind, lapply(1:prior_k, function(i)
+    prior_ws[i] * dnorm(data, prior_mu[i], prior_sds[i])))
+  Z <- apply(Z, 1, function(x) which(x == max(x))[1])
+  
+  mh_chains <- list()
+  gibbs_chains <- list()
+  mu0s = rnorm(n_chains, mean(data), sd(data))
+  t20s = abs(rnorm(n_chains, mean = var(data), sd = var(data) / 2))
+  for (i in 1:n_chains) {
+    mh_chains[[i]] <- mh_gmm(data, k, n_sims, mu_prior = mu0s[i], tau2_prior = t20s[i])
+    gibbs_chains[[i]] <- gibbs_gmm(data, k, n_sims, mu_prior = mu0s[i], tau2_prior = t20s[i])
+  }
+  
+  if (relabel) {
+    mh_chains <- lapply(mh_chains, function(chain) {
+      mh_post <- extract_posterior(chain, burn_in = 100)
+      relabeled <- relabel_means(mh_post$means, mh_post$weights)
+      chain$mu.save <- as.list(as.data.frame(t(relabeled$relabeled_means)))
+      chain$w.save <- as.list(as.data.frame(t(relabeled$relabeled_weights)))
+      chain$sigma2.save <- chain$sigma2.save[-(1:burn_in)]
+
+      return(chain)
+    })
+    gibbs_chains <- lapply(gibbs_chains, function(chain) {
+      gibbs_post <- extract_posterior(chain, burn_in = 100)
+      relabeled <- relabel_means(gibbs_post$means, gibbs_post$weights)
+      chain$mu.save <- as.list(as.data.frame(t(relabeled$relabeled_means)))
+      chain$w.save <- as.list(as.data.frame(t(relabeled$relabeled_weights)))
+      chain$sigma2.save <- chain$sigma2.save[-(1:burn_in)]
+      
+      return(chain)
+    })
+  }
+  if (mv == T) {
+    chains_array_mh <- combine_chains(mh_chains)
+    rhat_mh <- compute_multivariate_rhat_over_time(chains_array_mh)
+    
+    chains_array_gibbs <- combine_chains(gibbs_chains)
+    rhat_gibbs <- compute_multivariate_rhat_over_time(chains_array_gibbs)
+    rhat_mh_df <- data.frame(
+      Iteration = seq(2, length(rhat_mh)),
+      R_Hat = rhat_mh[-1],
+      Method = "MH (MV)"
+      )
+    rhat_gibbs_df <- data.frame(
+      Iteration = seq(2, length(rhat_gibbs)),
+      R_Hat = rhat_gibbs[-1],
+      Method = "Gibbs (MV)"
+      )
+  }
+  else {
+    mh_means <- lapply(mh_chains, function(chain) {
+      do.call(rbind, lapply(chain$mu.save, unlist))
+      })
+    gibbs_means <- lapply(gibbs_chains, function(chain) {
+      do.call(rbind, lapply(chain$mu.save, unlist))
+      })
+    rhat_mh <- rhat_over_time(mh_means)
+    rhat_gibbs <- rhat_over_time(gibbs_means)
+    
+    rhat_mh_df <- data.frame(
+      Iteration = seq(2, length(rhat_mh[[2]])),
+      R_Hat = rhat_mh[[2]][-1],
+      Method = "MH"
+    )
+    
+    rhat_gibbs_df <- data.frame(
+      Iteration = seq(2, length(rhat_gibbs[[2]])),
+      R_Hat = rhat_gibbs[[2]][-1],
+      Method = "Gibbs"
+    )
+  }
+  
+  
+  
+  rj_chains <- list()
+  for (i in 1:n_chains) {
+    rj_chains[[i]] <- uvnm.rjmcmc(data, n_sims, 7, prior_k, w = prior_ws, mu = mu0s[i], sigma2 = t20s[i], Z, verbose = F)
+  }
+  
+  rj_psrfv <- generate_psrfv_data(points_per_chain, rj_chains)
+  
+  rhat_rj_df <- data.frame(
+    Iteration = 1:nrow(rj_psrfv),
+    R_Hat = rj_psrfv$PSRFv,
+    Method = "RJMCMC"
+  )
+
+  combined_rhat_df <- rbind(rhat_mh_df, rhat_gibbs_df, rhat_rj_df)
+  
+  rhat_plot <- ggplot(combined_rhat_df, aes(x = Iteration, y = R_Hat, color = Method)) +
+    geom_line(linewidth = 1) +
+    geom_hline(yintercept = 1.05, linetype = "dashed", color = "orange") +
+    labs(
+      title = paste0("Gelman-Rubin", 
+                     ifelse(is.null(name), "", paste0(" (", name, ")"))),
+      x = "Iteration",
+      y = "R-hat",
+      color = "Method"
+    ) +
+    scale_color_manual(values = c("red", "limegreen", "blue")) +
+    ylim(1, 2.5) +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+  return(rhat_plot)
+}
+```
+
+## Posterior plot figure
+```{r}
+generate_combined_plot <- function(fits, data, title, true_means = NULL) {
+  rj = generate_posterior_predictive(fits$rj_post)
+  gib = generate_posterior_predictive(fits$gibbs_post)
+  mh = generate_posterior_predictive(fits$mh_post)
+  density_rj <- density(rj)
+  density_gib <- density(gib)
+  density_mh <- density(mh)
+  
+  # Create a data frame for the dataset
+  df <- data.frame(data = data)
+  
+  # Create density data frame for overlay lines
+  density_data <- data.frame(
+    x = c(density_rj$x, density_gib$x, density_mh$x),
+    y = c(density_rj$y, density_gib$y, density_mh$y),
+    method = factor(rep(c("RJMCMC", "Gibbs", "MH"), each = length(density_rj$x)))
+  )
+  
+  # Generate histogram with density lines
+  hist <- ggplot(df, aes(x = data)) +
+    geom_histogram(aes(y = ..density..), bins = 30, fill = "grey", color = "black", alpha = 0.7) +
+    geom_line(data = density_data, aes(x = x, y = y, color = method), size = 1.5) +
+    scale_color_manual(values = c("red", "limegreen", "blue")) +
+    labs(
+      title = title,
+      y = "Density",
+      color = "Method"
+    ) +
+    theme_minimal() +
+    xlim(min(data), max(data)) +
+    theme(
+      legend.position = "top",
+      plot.title = element_text(hjust = 0.5)
+    )
+  
+  # Define global x-axis limits
+  x_limits <- c(min(data) - (max(data)-min(data))/10, max(data))
+  
+  # Generate ridgeline posterior plots
+  plot_rj <- plot_ridgeline_posterior(fits$rj_post, "means", true_means, method = "RJ") +
+    scale_x_continuous(limits = x_limits)
+  
+  plot_gibbs <- plot_ridgeline_posterior(fits$gibbs_post, "means", true_means, method = "Gibbs") +
+    scale_x_continuous(limits = x_limits)
+  
+  plot_mh <- plot_ridgeline_posterior(fits$mh_post, "means", true_means, method = "MH") +
+    scale_x_continuous(limits = x_limits)
+  
+  # Combine all plots vertically
+  combined_plot <- (
+    hist /
+    plot_rj /
+    plot_gibbs /
+    plot_mh
+  )
+  
+  # Display the combined plot
+  print(combined_plot)
+  
+  # Save the plot to file
+  ggsave("combined_shared_xaxes_plot.png", combined_plot, width = 12, height = 20)
+}
+
+```
+
+
+## Acidity
+```{r}
+set.seed(14727)
+data(Acidity)
+a = Acidity
+
+# plot(density(a))
+# hist(a, breaks = 30)
+# 
+# afits = rj_gibbs_mh(a, 10000, 10, 3)
+# rj = generate_posterior_predictive(afits$rj_post)
+# gib = generate_posterior_predictive(afits$gibbs_post)
+# mh = generate_posterior_predictive(afits$mh_post)
+# 
+# generate_combined_plot(afits, a, "Acidity")
+
+
+points_per_chain = c(25)
+plot_a <- analyze_chains(a, k = 3, points_per_chain = points_per_chain, n_sims = 10000, mv = T)
+
+```
+
+```{r}
+generate_combined_plot <- function(fits, data, title, true_means = NULL, plot_a = NULL) {
+  rj = generate_posterior_predictive(fits$rj_post)
+  gib = generate_posterior_predictive(fits$gibbs_post)
+  mh = generate_posterior_predictive(fits$mh_post)
+  density_rj <- density(rj)
+  density_gib <- density(gib)
+  density_mh <- density(mh)
+  
+  df <- data.frame(data = data)
+  
+  density_data <- data.frame(
+    x = c(density_rj$x, density_gib$x, density_mh$x),
+    y = c(density_rj$y, density_gib$y, density_mh$y),
+    method = factor(rep(c("RJMCMC", "Gibbs", "MH"), each = length(density_rj$x)))
+  )
+  
+  hist <- ggplot(df, aes(x = data)) +
+    geom_histogram(aes(y = ..density..), bins = 30, fill = "grey", color = "black", alpha = 0.7) +
+    geom_line(data = density_data, aes(x = x, y = y, color = method), size = 1.5) +
+    scale_color_manual(values = c("red", "limegreen", "blue")) +
+    labs(
+      title = title,
+      y = "Density",
+      color = "Method"
+    ) +
+    theme_minimal() +
+    xlim(min(data), max(data)) +
+    theme(
+      legend.position = "top", 
+      legend.text = element_text(size = 30),
+      legend.key.size = unit(3.5, "lines"),
+      plot.title = element_text(hjust = 0.5, size = 30)
+    )
+  
+  x_limits <- c(min(data), max(data))
+  
+  # Generate ridgeline posterior plots
+  plot_gibbs <- plot_ridgeline_posterior(fits$gibbs_post, "means", true_means, method = "Gibbs") +
+    scale_x_continuous(limits = x_limits)
+  plot_mh <- plot_ridgeline_posterior(fits$mh_post, "means", true_means, method = "MH") +
+    scale_x_continuous(limits = x_limits)
+  plot_rj <- plot_ridgeline_posterior(fits$rj_post, "means", true_means, method = "RJ") +
+    scale_x_continuous(limits = x_limits)
+  
+  if (!is.null(plot_a)) {
+    combined_plot <- (
+      hist / 
+      plot_gibbs / 
+      plot_mh / 
+      plot_rj / 
+      plot_a # Add plot_a at the bottom
+    ) +
+      plot_layout(heights = c(1.25, .75, .75, .75, 1.5))
+
+  } else {
+    combined_plot <- (
+      hist / 
+      plot_rj / 
+      plot_gibbs / 
+      plot_mh
+    ) +
+      plot_layout(heights = c(1.5, 1, 1, 1))
+  }
+  #ggsave("combined_shared_xaxes_plot.png", combined_plot, width = 12, height = 24)
+  return(combined_plot)
+}
+```
+
+
+
+## Galaxy
+```{r, warning = FALSE}
+set.seed(14727)
+# plot(density(g))
+# 
+# gfits = rj_gibbs_mh(g, 10000, 10, 4)
+# generate_combined_plot(gfits,g, "Gravity")
+
+
+points_per_chain = c(25)
+plot_g <- analyze_chains(g, k = 4, points_per_chain = points_per_chain, n_sims = 10000, mv = T, name = "Gravity")
+generate_combined_plot(gfits, g, "Galaxies", plot_a  = plot_g)
+```
+
+
+
+## Fish
+```{r}
+set.seed(14727)
+data(fish)
+fish = fish[,1]
+
+fish_fits = rj_gibbs_mh(fish, 10000, 10, 4)
+generate_combined_plot(fish_fits, fish, "Fish")
+```
+
+
+
+```{r}
+set.seed(7475)
+# plot(density(fish))
+plot_fish <- analyze_chains(fish, k = 4, points_per_chain = c(25), n_sims = 10000, name = "Fish")
+generate_combined_plot(fish_fits, fish, "Fish", plot_a  = plot_fish)
+```
+
+```{r}
+acidfig = generate_combined_plot(afits, a, "Acidity", plot_a = plot_a)
+galfig = generate_combined_plot(gfits, g, "Galaxies", plot_a = plot_g)
+fishfig = generate_combined_plot(fish_fits, fish, "Fish", plot_a = plot_fish)
+
+combined_side_by_side <- acidfig | galfig | fishfig
+
+ggsave("combined_side_by_side.png", combined_side_by_side, width = 36, height = 24)
+```
+
+```{r}
+s1fig = generate_combined_plot(fits, data1, "S1, k = 5", mus, plot_a = plot_s1)
+s2fig = generate_combined_plot(fits_s2, data2, "S2, k = 5", mus2, plot_a = plot_s2)
+s3fig = generate_combined_plot(fits_s4, data3, "S3, k = 3", mus3, plot_a = plot_s4)
+s4fig = generate_combined_plot(fits_s5, data4, "S4, k = 4, n = 125", mus4, plot_a = plot_s5)
+
+combined_side_by_side <- s1fig | s2fig | s3fig | s4fig 
+
+ggsave("combined_side_by_side.png", combined_side_by_side, width = 48, height = 24)
+```
+
+
+
+## Tests
+
+```{r}
+set.seed(223)
+k = 5
+w = rdirichlet(1, rep(2, k))[1,]
+mus = rnorm(k, 10, 5)
+vars = runif(k, .25, sqrt(k))
+data1 = rnormmix(200, w, mus, vars)
+#hist(data, breaks = 40)
+fits = rj_gibbs_mh(data, 10000, 10, 3, relabel = F)
+# generate_combined_plot(fits, data, "Synthetic n = 200, k = 5", true_means = mus)
+
+plot_s1 <- analyze_chains(data, k = 3, points_per_chain = c(25), n_sims = 10000, name = "S1, k = 5")
+generate_combined_plot(fits, data, "", mus, plot_a = plot_s1)
+```
+
+
+```{r}
+set.seed(776)
+k = 5
+weights = rdirichlet(1, rep(2, k))[1,]
+mus2 = runif(k, 25, 50)
+vars = runif(k, .25, 3/4*k)
+data2 = rnormmix(200, weights, mus2, vars)
+# hist(data, breaks = 40)
+fits_s2 = rj_gibbs_mh(data, 10000, 10, 4, relabel = F)
+# 
+# generate_combined_plot(fits, data, "Synthetic n = 200, k = 5", mus)
+
+plot_s2 <- analyze_chains(data, k = 4, points_per_chain = c(25), n_sims = 10000, name = "S2, k = 5")
+generate_combined_plot(fits_s2, data, "", mus, plot_a = plot_s2)
+```
+
+```{r}
+set.seed(14727)
+k = 4
+w = rdirichlet(1, rep(1.5,k))[1,]
+mus = runif(k, 6, 12)
+sds = runif(k, 0.25, sqrt(k))
+
+data = rnormmix(200, w, mus, sds)
+hist(data, breaks = 30)
+
+fits_s3 = rj_gibbs_mh(data, 10000, 10, 3, relabel = F)
+
+generate_combined_plot(fits, data, "k = 4", mus)
+
+#plot <- analyze_chains(data, k = 3, points_per_chain = c(12), mv = T, n_sims = 3000)
+#print(plot)
+```
+
+```{r}
+set.seed(325)
+k = 3
+mus3 = runif(k, 5.5, 9)
+sds = runif(k, 0.25, 2/3*k)
+w = rdirichlet(1, rep(1.5,k))[1,]
+data3 = rnormmix(200, w, mus3, sds)
+hist(data, breaks = 30)
+fits_s4 = rj_gibbs_mh(data, 10000, 10, 3, relabel = F)
+generate_combined_plot(fits, data, "k = 3", mus)
+
+plot_s4 <- analyze_chains(data, k = 4, points_per_chain = c(25), n_sims = 10000, name = "S4, k = 3")
+generate_combined_plot(fits_s4, data, "", mus, plot_a = plot_s4)
+```
+
+```{r}
+set.seed(44)
+k = 4
+mus4 = runif(k, 3, 7)
+sds = runif(k, 0.25, 1/2*k)
+w = rdirichlet(1, rep(1.25,k))[1,]
+data4 = rnormmix(125, w, mus4, sds)
+# hist(data, breaks = 30)
+# 
+fits_s5 = rj_gibbs_mh(data, 10000, 10, 3, relabel = F)
+# generate_combined_plot(fits, data, "n = 125, k = 4", mus)
+
+plot_s5 <- analyze_chains(data, k = 4, points_per_chain = c(25), n_sims = 10000, name = "S5, k = 4, n = 125")
+generate_combined_plot(fits_s5, data, "S4, k = 4, n = 125", mus, plot_a = plot_s5)
+```
+
+```{r}
+set.seed(318)
+k = 5
+mus = runif(k, -3, 3)
+sds = runif(k, 0.25, 1/2*k)
+w = rdirichlet(1, rep(1.25,k))[1,]
+data = rnormmix(125, w, mus, sds)
+hist(data, breaks = 30)
+
+fits = rj_gibbs_mh(data, 10000, 10, 2, relabel = F)
+
+
+plot <- analyze_chains(data, k = 2, points_per_chain = c(12), mv = T, n_sims = 3000)
+print(plot)
+```
+
+```{r}
+set.seed(75913)
+k = 5
+mus = runif(k, -4, 4)
+sds = runif(k, 0.25, 3/4*k)
+w = rdirichlet(1, rep(1.25,k))[1,]
+data = rnormmix(125, w, mus, sds)
+hist(data, breaks = 40)
+
+fits = rj_gibbs_mh(data, 10000, 10, 4, relabel = F)
+rj = generate_posterior_predictive(fits$rj_post)
+gib = generate_posterior_predictive(fits$gibbs_post)
+mh = generate_posterior_predictive(fits$mh_post)
+hist(data, main = "Posterior Predictive Distributions", ylab = "Density", prob = T, ylim = c(0,0.3), breaks = 30)
+lines(density(rj), col = "red", lwd = 3)
+lines(density(gib), col = "blue", lty = 2, lwd = 3)
+lines(density(mh), col = "green3", lty = 4, lwd = 3)
+legend("topright", legend = c("RJMCMC", "Gibbs", "MH"),
+       col = c("red", "blue", "green3"), lwd = 2, lty = c(1, 2, 3))
+
+plot_ridgeline_posterior(fits$rj_post, "means", mus, "RJ")
+plot_ridgeline_posterior(fits$gibbs_post, "means", mus, "Gibbs")
+plot_ridgeline_posterior(fits$mh_post, "means", mus, "MH")
+plot <- analyze_chains(data, k = 2, points_per_chain = c(12), mv = T, n_sims = 3000)
+print(plot)
+```
+
+```{r}
+set.seed(14727)
+data = tests[["t1"]]$values
+mus = tests[["t1"]]$means
+hist(data, breaks = 30)
+
+fits = rj_gibbs_mh(data, 5000, 10, 3, relabel = F)
+rj = generate_posterior_predictive(fits$rj_post)
+gib = generate_posterior_predictive(fits$gibbs_post)
+mh = generate_posterior_predictive(fits$mh_post)
+hist(data, main = "Posterior Predictive Distributions", ylab = "Density", prob = T, ylim = c(0,0.3), breaks = 30)
+lines(density(rj), col = "red", lwd = 3)
+lines(density(gib), col = "blue", lty = 2, lwd = 3)
+lines(density(mh), col = "green3", lty = 4, lwd = 3)
+legend("topright", legend = c("RJMCMC", "Gibbs", "MH"),
+       col = c("red", "blue", "green3"), lwd = 2, lty = c(1, 2, 3))
+
+plot_ridgeline_posterior(fits$rj_post, "means", mus, "RJ")
+plot_ridgeline_posterior(fits$gibbs_post, "means", mus, "Gibbs")
+plot_ridgeline_posterior(fits$mh_post, "means", mus, "MH")
+```
+
+```{r}
+set.seed(75913)
+data = tests[["t2"]]$values
+mus = tests[["t2"]]$means
+hist(data, breaks = 30)
+
+fits = rj_gibbs_mh(data, 5000, 10, 3, relabel = F)
+rj = generate_posterior_predictive(fits$rj_post)
+gib = generate_posterior_predictive(fits$gibbs_post)
+mh = generate_posterior_predictive(fits$mh_post)
+hist(data, main = "Posterior Predictive Distributions", ylab = "Density", prob = T, ylim = c(0,0.3), breaks = 30)
+lines(density(rj), col = "red", lwd = 3)
+lines(density(gib), col = "blue", lty = 2, lwd = 3)
+lines(density(mh), col = "green3", lty = 4, lwd = 3)
+legend("topright", legend = c("RJMCMC", "Gibbs", "MH"),
+       col = c("red", "blue", "green3"), lwd = 2, lty = c(1, 2, 3))
+
+plot_ridgeline_posterior(fits$rj_post, "means", mus, "RJ")
+plot_ridgeline_posterior(fits$gibbs_post, "means", mus, "Gibbs")
+plot_ridgeline_posterior(fits$mh_post, "means", mus, "MH")
+```
+
+```{r}
+set.seed(75913)
+data = tests[["t3"]]$values
+mus = tests[["t3"]]$means
+hist(data, breaks = 30)
+
+fits = rj_gibbs_mh(data, 5000, 10, 3, relabel = F)
+rj = generate_posterior_predictive(fits$rj_post)
+gib = generate_posterior_predictive(fits$gibbs_post)
+mh = generate_posterior_predictive(fits$mh_post)
+hist(data, main = "Posterior Predictive Distributions", ylab = "Density", prob = T, ylim = c(0,0.3), breaks = 30)
+lines(density(rj), col = "red", lwd = 3)
+lines(density(gib), col = "blue", lty = 2, lwd = 3)
+lines(density(mh), col = "green3", lty = 4, lwd = 3)
+legend("topright", legend = c("RJMCMC", "Gibbs", "MH"),
+       col = c("red", "blue", "green3"), lwd = 2, lty = c(1, 2, 3))
+
+plot_ridgeline_posterior(fits$rj_post, "means", mus, "RJ")
+plot_ridgeline_posterior(fits$gibbs_post, "means", mus, "Gibbs")
+plot_ridgeline_posterior(fits$mh_post, "means", mus, "MH")
+```
+
+```{r}
+set.seed(14727)
+data = tests[["t4"]]$values
+mus = tests[["t4"]]$means
+hist(data, breaks = 30)
+
+fits = rj_gibbs_mh(data, 5000, 10, 2, relabel = F)
+rj = generate_posterior_predictive(fits$rj_post)
+gib = generate_posterior_predictive(fits$gibbs_post)
+mh = generate_posterior_predictive(fits$mh_post)
+hist(data, main = "Posterior Predictive Distributions", ylab = "Density", prob = T, ylim = c(0,0.3), breaks = 30)
+lines(density(rj), col = "red", lwd = 3)
+lines(density(gib), col = "blue", lty = 2, lwd = 3)
+lines(density(mh), col = "green3", lty = 4, lwd = 3)
+legend("topright", legend = c("RJMCMC", "Gibbs", "MH"),
+       col = c("red", "blue", "green3"), lwd = 2, lty = c(1, 2, 3))
+
+plot_ridgeline_posterior(fits$rj_post, "means", mus, "RJ")
+plot_ridgeline_posterior(fits$gibbs_post, "means", mus, "Gibbs")
+plot_ridgeline_posterior(fits$mh_post, "means", mus, "MH")
+```
+
+```{r}
+set.seed(14727)
+data = tests[["t5"]]$values
+mus = tests[["t5"]]$means
+hist(data, breaks = 30)
+
+fits = rj_gibbs_mh(data, 5000, 10, 3, relabel = F)
+rj = generate_posterior_predictive(fits$rj_post)
+gib = generate_posterior_predictive(fits$gibbs_post)
+mh = generate_posterior_predictive(fits$mh_post)
+hist(data, main = "Posterior Predictive Distributions", ylab = "Density", prob = T, ylim = c(0,0.3), breaks = 30)
+lines(density(rj), col = "red", lwd = 3)
+lines(density(gib), col = "blue", lty = 2, lwd = 3)
+lines(density(mh), col = "green3", lty = 4, lwd = 3)
+legend("topright", legend = c("RJMCMC", "Gibbs", "MH"),
+       col = c("red", "blue", "green3"), lwd = 2, lty = c(1, 2, 3))
+
+plot_ridgeline_posterior(fits$rj_post, "means", mus, "RJ")
+plot_ridgeline_posterior(fits$gibbs_post, "means", mus, "Gibbs")
+plot_ridgeline_posterior(fits$mh_post, "means", mus, "MH")
+```
+
+```{r}
+set.seed(14727)
+data = tests[["t6"]]$values
+mus = tests[["t6"]]$means
+hist(data, breaks = 30)
+
+fits = rj_gibbs_mh(data, 5000, 10, 3, relabel = F)
+rj = generate_posterior_predictive(fits$rj_post)
+gib = generate_posterior_predictive(fits$gibbs_post)
+mh = generate_posterior_predictive(fits$mh_post)
+hist(data, main = "Posterior Predictive Distributions", ylab = "Density", prob = T, ylim = c(0,0.3), breaks = 30)
+lines(density(rj), col = "red", lwd = 3)
+lines(density(gib), col = "blue", lty = 2, lwd = 3)
+lines(density(mh), col = "green3", lty = 4, lwd = 3)
+legend("topright", legend = c("RJMCMC", "Gibbs", "MH"),
+       col = c("red", "blue", "green3"), lwd = 2, lty = c(1, 2, 3))
+
+plot_ridgeline_posterior(fits$rj_post, "means", mus, "RJ")
+plot_ridgeline_posterior(fits$gibbs_post, "means", mus, "Gibbs")
+plot_ridgeline_posterior(fits$mh_post, "means", mus, "MH")
+```
+
+```{r}
+set.seed(14727)
+data = tests[["t7"]]$values
+mus = tests[["t7"]]$means
+hist(data, breaks = 30)
+
+fits = rj_gibbs_mh(data, 5000, 10, 3, relabel = F)
+rj = generate_posterior_predictive(fits$rj_post)
+gib = generate_posterior_predictive(fits$gibbs_post)
+mh = generate_posterior_predictive(fits$mh_post)
+hist(data, main = "Posterior Predictive Distributions", ylab = "Density", prob = T, ylim = c(0,0.3), breaks = 30)
+lines(density(rj), col = "red", lwd = 3)
+lines(density(gib), col = "blue", lty = 2, lwd = 3)
+lines(density(mh), col = "green3", lty = 4, lwd = 3)
+legend("topleft", legend = c("RJMCMC", "Gibbs", "MH"),
+       col = c("red", "blue", "green3"), lwd = 2, lty = c(1, 2, 3))
+
+plot_ridgeline_posterior(fits$rj_post, "means", mus, "RJ")
+plot_ridgeline_posterior(fits$gibbs_post, "means", mus, "Gibbs")
+plot_ridgeline_posterior(fits$mh_post, "means", mus, "MH")
+```
+
+## Speed Test
+```{r}
+set.seed(7475)
+library(microbenchmark)
+ws = c(1)
+means = c(mean(g))
+vars = c(max(g)-min(g))
+n_sims = 10000
+Z <- do.call(cbind, lapply(1:1, function(i)
+                                    ws[i]*dnorm(g, means[i], sqrt(vars[i]))))
+Z <- apply(Z, 1, function(x) which(x==max(x))[1])
+bench = microbenchmark(
+  uvnm.rjmcmc(g, n_sims, 10, 1, w = ws, mu = means, 
+              sigma2 = vars, Z, verbose = F), 
+  gibbs_gmm(g, 4, n_sims),
+  mh_gmm(g, 4, n_sims),
+  times = 100
+)
+gib = gibbs_gmm(g, 4, n_sims)
+bench_g <- bench %>%
+  mutate(expr = case_when(
+    grepl("rjmcmc", expr) ~ "RJ",
+    grepl("mh_gmm", expr) ~ "MH",
+    grepl("gibbs_gmm", expr) ~ "Gibbs"
+  ),
+  time = time/1e9
+  )
+
+fig_bench_g = ggplot(bench_g, aes(x = expr, y = time, fill = expr)) +
+  geom_boxplot() +
+  labs(
+    title = "Execution Time, 10,000 sims, 100 reps, Galaxies",
+    x = "Method",
+    y = "Execution Time (seconds)"
+  ) +
+  guides(fill = "none") + 
+  theme_minimal() +
+  theme(axis.text = element_text(size = 24),
+        axis.title.y = element_text(size = 26),
+        plot.title = element_text(size = 26))
+fig_bench_g
+means = c(mean(data1))
+vars = c(max(data1)-min(data1))
+
+Z <- do.call(cbind, lapply(1:1, function(i)
+                                    ws[i]*dnorm(data1, means[i], sqrt(vars[i]))))
+Z <- apply(Z, 1, function(x) which(x==max(x))[1])
+bench = microbenchmark(
+  uvnm.rjmcmc(y = data1, n_sims, 10, 1, w = ws, mu = means, 1, 
+              sigma2 = vars, Z = Z, verbose = F), 
+  gibbs_gmm(data1, 3, n_sims),
+  mh_gmm(data1, 3, n_sims),
+  times = 100
+)
+
+bench_s1 <- bench %>%
+  mutate(expr = case_when(
+    grepl("rjmcmc", expr) ~ "RJ",
+    grepl("mh_gmm", expr) ~ "MH",
+    grepl("gibbs_gmm", expr) ~ "Gibbs"
+  ),
+  time = time/1e9
+  )
+
+fig_s1_bench = ggplot(bench_s1, aes(x = expr, y = time, fill = expr)) +
+  geom_boxplot() +
+  labs(
+    title = "Execution Time, 10,000 sims, 100 reps, S1",
+    x = "Method",
+    y = "Execution Time (seconds)"
+  ) +
+  theme_minimal() +
+  theme(legend.key.size = unit(3, "lines"),
+        legend.text = element_text(size = 26),
+        axis.text = element_text(size = 24),
+        axis.title.y = element_text(size = 26),
+        plot.title = element_text(size = 26))
+fig_s1_bench
+```
+```{r}
+combined_side_by_side <- fig_bench_g | fig_s1_bench 
+
+ggsave("combined_side_by_side.png", combined_side_by_side, width = 24, height = 16)
+```
+
+
+
+# Generate Traceplots
+```{r}
+generate_trace_plots <- function(fit, burn_in = 1000, method = "rj") {
+  if (method == "rj") {
+    # RJMCMC case
+    k_samples <- fit$k.save[-(1:burn_in)]
+    weights_samples <- fit$w.save[-(1:burn_in)]
+    means_samples <- fit$mu.save[-(1:burn_in)]
+    variances_samples <- fit$sigma2.save[-(1:burn_in)]
+    
+    # Trace plot for k
+    k_trace <- data.frame(iteration = seq_along(k_samples), k = k_samples)
+    p_k <- ggplot(k_trace, aes(x = iteration, y = k)) +
+      geom_line(color = "blue") +
+      labs(title = "Trace Plot of k (RJMCMC)", x = "Iteration", y = "k") +
+      theme_minimal()
+    
+    # Identify most probable k
+    most_probable_k <- as.integer(names(which.max(table(k_samples))))
+    indices <- which(k_samples == most_probable_k)
+    
+    # Extract samples for the most probable k
+    weights <- do.call(rbind, lapply(weights_samples[indices], unlist))
+    means <- do.call(rbind, lapply(means_samples[indices], unlist))
+    variances <- do.call(rbind, lapply(variances_samples[indices], unlist))
+    
+    # Prepare data for faceted plots
+    weights_trace <- melt(data.frame(iteration = 1:nrow(weights), weights), id.vars = "iteration")
+    means_trace <- melt(data.frame(iteration = 1:nrow(means), means), id.vars = "iteration")
+    variances_trace <- melt(data.frame(iteration = 1:nrow(variances), variances), id.vars = "iteration")
+    
+    # Trace plots with faceting
+    p_weights <- ggplot(weights_trace, aes(x = iteration, y = value)) +
+      geom_line(color = "blue") +
+      facet_wrap(~ variable, scales = "free_y") +
+      labs(title = "Trace Plots of Weights (RJMCMC)", x = "Iteration", y = "Weight") +
+      theme_minimal()
+    
+    p_means <- ggplot(means_trace, aes(x = iteration, y = value)) +
+      geom_line(color = "blue") +
+      facet_wrap(~ variable, scales = "free_y") +
+      labs(title = "Trace Plots of Means (RJMCMC)", x = "Iteration", y = "Mean") +
+      theme_minimal()
+    
+    p_variances <- ggplot(variances_trace, aes(x = iteration, y = value)) +
+      geom_line(color = "blue") +
+      facet_wrap(~ variable, scales = "free_y") +
+      labs(title = "Trace Plots of Variances (RJMCMC)", x = "Iteration", y = "Variance") +
+      theme_minimal()
+    
+    return(list(k_trace = p_k, weights_trace = p_weights, means_trace = p_means, variances_trace = p_variances))
+    
+  } 
+  else {
+    # Gibbs or MH case
+    weights_samples <- fit$w.save[-(1:burn_in)]
+    means_samples <- fit$mu.save[-(1:burn_in)]
+    variances_samples <- fit$sigma2.save[-(1:burn_in)]
+    
+    # Create matrices
+    weights <- do.call(rbind, lapply(weights_samples, unlist))
+    means <- do.call(rbind, lapply(means_samples, unlist))
+    variances <- do.call(rbind, lapply(variances_samples, unlist))
+    
+    # Prepare data for faceted plots
+    weights_trace <- melt(data.frame(iteration = 1:nrow(weights), weights), id.vars = "iteration")
+    means_trace <- melt(data.frame(iteration = 1:nrow(means), means), id.vars = "iteration")
+    variances_trace <- melt(data.frame(iteration = 1:nrow(variances), variances), id.vars = "iteration")
+    
+    # Trace plots with faceting
+    p_weights <- ggplot(weights_trace, aes(x = iteration, y = value)) +
+      geom_line(color = "blue") +
+      facet_wrap(~ variable, scales = "free_y") +
+      labs(title = paste("Trace Plots of Weights"), x = "Iteration", y = "Weight") +
+      theme_minimal()
+    
+    p_means <- ggplot(means_trace, aes(x = iteration, y = value)) +
+      geom_line(color = "blue") +
+      facet_wrap(~ variable, scales = "free_y") +
+      labs(title = paste("Trace Plots of Means"), x = "Iteration", y = "Mean")
+    
+    p_variances <- ggplot(variances_trace, aes(x = iteration, y = value)) +
+      geom_line(color = "blue") +
+      facet_wrap(~ variable, scales = "free_y") +
+      labs(title = paste("Trace Plots of Variances"), x = "Iteration", y = "Variance")
+    
+    return(list(weights_trace = p_weights, means_trace = p_means, variances_trace = p_variances))
+  }
+}
+```
+
+# RJMCMC Classification
+```{r}
+rjmcmc_density_classification <- function(data, n_sims, w, mu, sigma2, kmin, kmax, em = F, em_k, class = T) {
+  Z <- do.call(cbind, lapply(1:kmin, function(i)
+                                    w[i]*dnorm(data, mu[i], sqrt(sigma2[i]))))
+  Z <- apply(Z, 1, function(x) which(x==max(x))[1])
+  result <- uvnm.rjmcmc(data, nsweep = n_sims, kmax = kmax, k = kmin,
+                        w = w, mu = mu, sigma2 = sigma2, Z = Z, verbose = F)
+  
+  # Extract number of components sampled
+  ksave <- result$k.save
+  
+  # Posterior probability distribution over k
+  posterior_k <- round(table(ksave[-(1:(n_sims / 2))]) / (n_sims / 2), kmax)
+  print(posterior_k)
+  focus_k <- as.integer(names(which.max(posterior_k)))
+  # Conditional density estimation for the chosen number of components (focus_k)
+  pick_k <- which(ksave == focus_k)
+  w <- unlist(result$w.save[pick_k])
+  mu <- unlist(result$mu.save[pick_k])
+  sigma2 <- unlist(result$sigma2.save[pick_k])
+  den_estimate <- rep(w, each = length(data)) *
+    dnorm(rep(data, length(w)), mean = rep(mu, each = length(data)),
+          sd = rep(sqrt(sigma2), each = length(data)))
+  den_estimate <- rowMeans(matrix(den_estimate, nrow = length(data))) * focus_k
+  
+  if(em == F & class == T) {
+    class <- apply(result$Z.save[, pick_k], 1, function(x) {
+    sapply(1:focus_k, function(k) sum(x == k))
+      })
+    class <- max.col(t(class))
+    hist(data, freq = FALSE, breaks = 20, axes = FALSE, ylim = c(-.1*focus_k, 0.6),
+       main = "Density Estimation and Classification", ylab = "")
+    axis(2, at = c(-(focus_k:1) / 10, seq(0, 10, 2) / 10),
+         labels = c(focus_k:1, seq(0, 10, 2) / 10), font = 2)
+    lines(sort(data), den_estimate[order(data)], col = "red")
+    for (i in 1:focus_k) {
+      points(data[class == i], rep(-i / 10, length(data[class == i])), col = i, pch = i)
+      }
+    mtext("Density", 2, at = 0.5, line = 2)
+    mtext("Classification", 2, at = -0.15, line = 2)
+  }
+  else if(class == F) {
+    hist(data, freq = FALSE, breaks = 20,
+     main = "Posterior Density Approximation", xlab = "Data", ylab = "Density")
+    lines(sort(data), den_estimate[order(data)], col = "red", lwd = 2, lty = 1)
+  }
+  else {
+    emgauss_results <- EMGauss(data, K = em_k)
+    em_weights <- emgauss_results$Weight
+    em_means <- emgauss_results$Means
+    em_sds <- emgauss_results$SDs
+    em_density <- sapply(sort(data), function(x) {
+      sum(em_weights * dnorm(x, mean = em_means, sd = em_sds))
+      })
+    hist(data, freq = FALSE, breaks = 20, ylim = c(0, max(em_density)),
+     main = "Density Comparison: RJMCMC vs EMGauss", xlab = "Data", ylab = "Density")
+    lines(sort(data), den_estimate[order(data)], col = "red", lwd = 2, lty = 1)
+    lines(sort(data), em_density, col = "blue", lwd = 2, lty = 1)
+    legend("topright", legend = c("RJMCMC Density", "EMGauss Density"),
+       col = c("red", "blue"), lty = 1, lwd = 2)
+  }
+
+}
+set.seed(14727)
+k = 4
+w = rdirichlet(1, rep(1.5,k))
+data = gen_data(k, w, c(.75,3.5), c(0,20), 120)
+hist(data, breaks = 30)
+
+rjmcmc_density_classification(a, 10000, c(1), c(mean(data)), c(var(data)), 1, 10, F, 4)
+```
+
+
+
+
+```{r}
+set.seed(14727)
+data = gen_data(4, rdirichlet(1, rep(1.5,4)), c(.5,3), c(0,10), 1000)
+hist(data, breaks = 40)
+
+rjmcmc_density_classification(data, 20000, c(1), c(mean(data)), c(var(data)), 1, 20, T, 2)
+```
+
+
+## Inspiration
+```{r}
+#12
+set.seed(23)
+num_samples <- 12 
+n_obs <- 150
+min_components <- 4
+max_components <- 6
+
+samples <- list()
+
+generate_mu <- function(n_components, range_min, range_max, min_distance) {
+  candidates <- numeric(n_components)
+  for (i in 1:n_components) {
+    repeat {
+      candidate <- runif(1, range_min, range_max) # Random value in the range
+      # Check distance constraint with already selected values
+      if (all(abs(candidate - candidates[1:(i-1)]) >= min_distance) || i == 1) {
+        candidates[i] <- candidate
+        break
+      }
+    }
+  }
+  return(candidates)
+}
+
+for (i in 1:num_samples) {
+  n_components <- sample(min_components:max_components, 1)
+  range_min = -5
+  range_max = 5
+  min_distance = 1
+  mu <- generate_mu(n_components, range_min, range_max, min_distance)
+  lambda <- rdirichlet(1.25, rep(1, n_components))[1, ]
+  sigma <- runif(n_components, min = 0.25, max = 1.5)  
+  sample_data <- rnormmix(n_obs, lambda = lambda, mu = mu, sigma = sigma)
+  samples[[i]] <- list(
+    components = n_components,
+    weights = lambda,
+    means = mu,
+    sds = sigma,
+    values = sample_data
+  )
+}
+
+par(mfrow = c(3, 4))  # arrange plots in a grid
+for (i in 1:num_samples) {
+  hist(samples[[i]]$values, breaks = 30, main = paste("Sample", i),
+       xlab = "Value")
+}
+
+par(mfrow = c(1, 1))
+#k_guesses = c(3,3, 2, 3, 3, 4, 3, 2, 3, 3, 5, 2, 3)
+```
+```{r}
+# from seed 1
+tests = list(
+  t1 = samples[[5]],
+  t2 = samples[[9]],
+  t3 = samples[[11]],
+  t4 = samples[[12]]
+)
+```
+
+```{r}
+# from seed 4
+tests[["t5"]] = samples[[9]]
+```
+
+```{r}
+# from 9
+tests[["t6"]] = samples[[10]]
+```
+
+
+```{r}
+# from 10
+tests[["t7"]] = samples[[8]]
+```
+
+
+
+## evaluate_metrics
+```{r}
+evaluate_metrics <- function(mh_fit, gibbs_fit) {
+  # Standardize fit and mh_fit structures into rectangular matrices
+  make_rectangular <- function(lst) {
+    max_length <- max(sapply(lst, length))  # Find the maximum vector length
+    t(sapply(lst, function(x) {
+      c(x, rep(NA, max_length - length(x)))  # Pad with NA to match max length
+    }))
+  }
+  
+  # Standardize the structures
+  mu_matrix_mh <- make_rectangular(mh_fit$means)
+  sigma2_matrix_mh <- make_rectangular(mh_fit$sds)
+  pi_matrix_mh <- make_rectangular(mh_fit$weights)
+  
+  # Compute posterior means
+  metrics <- list()
+  metrics$posterior_means <- data.frame(
+    Method = c("MH", "Gibbs"),
+    Mu = I(list(
+      colMeans(mu_matrix_mh, na.rm = TRUE),  # Posterior mean for MH
+      colMeans(gibbs_fit$mu)                 # Posterior mean for Gibbs
+    )),
+    Sigma2 = I(list(
+      colMeans(sigma2_matrix_mh, na.rm = TRUE),  # Posterior variance for MH
+      colMeans(gibbs_fit$sigma2)                 # Posterior variance for Gibbs
+    )),
+    Pi = I(list(
+      colMeans(pi_matrix_mh, na.rm = TRUE),  # Posterior weights for MH
+      colMeans(gibbs_fit$pi)                 # Posterior weights for Gibbs
+    ))
+  )
+  
+  metrics$ess <- data.frame(
+    Method = c("MH", "Gibbs"),
+    ESS_Mu = c(
+      mean(effectiveSize(as.mcmc(mu_matrix_mh)), na.rm = TRUE),  # ESS for MH
+      mean(effectiveSize(as.mcmc(gibbs_fit$mu)), na.rm = TRUE)   # ESS for Gibbs
+    ),
+    ESS_Sigma2 = c(
+      mean(effectiveSize(as.mcmc(sigma2_matrix_mh)), na.rm = TRUE),  # ESS for MH
+      mean(effectiveSize(as.mcmc(gibbs_fit$sigma2)), na.rm = TRUE)   # ESS for Gibbs
+    ),
+    ESS_Pi = c(
+      mean(effectiveSize(as.mcmc(pi_matrix_mh)), na.rm = TRUE),  # ESS for MH
+      mean(effectiveSize(as.mcmc(gibbs_fit$pi)), na.rm = TRUE)   # ESS for Gibbs
+    )
+  )
+  
+  # Posterior Predictive Checks
+  predictive_mh <- rnorm(1000, mean = mean(mu_matrix_mh, na.rm = TRUE), sd = sqrt(mean(sigma2_matrix_mh, na.rm = TRUE)))
+  predictive_gibbs <- rnorm(1000, mean = mean(gibbs_fit$mu), sd = sqrt(mean(gibbs_fit$sigma2)))
+  
+  metrics$posterior_predictive <- list(
+    MH = predictive_mh,
+    Gibbs = predictive_gibbs
+  )
+  
+  return(metrics)
+}
+
+metrics = evaluate_metrics(mh_fit, gibbs_fit)
+```
+
+## gibbs vs rj
+```{r}
+gibbs_vs_rj = function(n_sims, burn_in, data, prior_k, upper_k, ws, mus, sds) {
+  k = prior_k
+  Z <- do.call(cbind, lapply(1:k, function(i)
+                                    ws[i]*dnorm(data, mus[i], sds[i])))
+  Z <- apply(Z, 1, function(x) which(x==max(x))[1])
+  fit_rj = uvnm.rjmcmc(data, n_sims, upper_k, k, w = ws, mu = rep(mean(data), k), 
+                       sigma2 = rep(var(data), k), Z, verbose = F)
+  fit_gibbs = gibbs_sampler(data, n_sims, ceiling(mean(prior_k,upper_k)))
+
+  x_values <- seq(min(data)-sd(data), max(data)+sd(data), length.out = 1000)
+  posterior_vals_rj <- posterior_density_rjmcmc(
+    x = x_values,
+    w_save = fit_rj$w.save,
+    mu_save = fit_rj$mu.save,
+    sigma2_save = fit_rj$sigma2.save,
+    burn_in = burn_in
+    )
+  posterior_values_gibbs <- posterior_density(
+    x_values, 
+    fit_gibbs$means[(burn_in + 1):nrow(fit_gibbs$means), , drop = F],
+    fit_gibbs$vars[(burn_in + 1):nrow(fit_gibbs$vars), , drop = F],
+    fit_gibbs$weights[(burn_in + 1):nrow(fit_gibbs$weights), , drop = F]
+  )
+  
+  plot(density(data), col = "black", main = "Posterior vs. Data Densities")
+  lines(x_values, posterior_vals_rj, type = "l", col = "blue")
+  lines(x_values, posterior_values_gibbs, col = "red")
+  legend("topright", legend = c("Data", "RJ", "Gibbs"), col = c("black", "blue", "red"), lty = 1)
+  
+  invisible(NULL)
+}
+```
