@@ -1,0 +1,744 @@
+---
+title: "L2M"
+author: "John Gillen"
+date: "2025-02-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(hoopR)
+library(slider)
+library(stringr)
+library(fuzzyjoin)
+library(data.table)
+library(lme4)
+library(car)
+library(lmtest)
+library(sandwich)
+library(gridExtra)
+library(cowplot)
+#library(rstan)
+#library(shinystan)
+
+progressr::with_progress({
+  pbp = hoopR::load_nba_pbp(seasons = c(seq(2015,2025,1)))
+})
+
+fake_teams = c("All-Stars", "Team Stephen", "USA", "Team Giannis", "Usa", "Team Durant", "Team LeBron")
+
+pbp = pbp |>
+  rename(home = home_team_mascot, away = away_team_mascot, date = game_date,
+         time_min = clock_minutes, time_sec = clock_seconds) |>
+  mutate(date = as.integer(gsub("-", "", date)),
+         game_sec = 60*time_min + time_sec,
+         score_diff = home_score - away_score) |>
+  filter(date > 20150300 &
+    !(home %in% fake_teams) &
+           (period == 4 & (time_min < 2 | (time_min == 2 & time_sec == 0)) | 
+              (period > 4 & period < 9)))
+
+# Only games that were within 3 points during the last 2 minutes qualify for l2m
+close_games = pbp |>
+  mutate(score_diff = home_score - away_score) |>
+  group_by(game_id) |>
+  summarize(close_game = any(abs(score_diff) <= 3), .groups = "drop")
+
+pbp_l2m = pbp |>
+  inner_join(close_games |> filter(close_game), by = "game_id")
+
+to_drop_pbp = c(
+  "sequence_number", "id", "period_display_value", "clock_display_value", 
+  "athlete_id_1", "athlete_id_2", "athlete_id_3", "wallclock", 
+  "coordinate_x_raw", "coordinate_y_raw", "home_team_name", 
+  "home_team_abbrev", "home_team_name_alt", "away_team_name", 
+  "away_team_abbrev", "away_team_name_alt", "time", "half", "game-half", 
+  "lead_qtr", "lead_half", "start_quarter_seconds_remaining", 
+  "start_half_seconds_remaining", "qtr", "lead_half", "start_quarter_seconds_remaining", 
+  "start_half_seconds_remaining", "end_half_seconds_remaining", "end_game_seconds_remaining", 
+  "period_number", "lag_qtr", "lag_game_half", "coordinate_x", "coordinate_y", "game_date_time", 
+  "home_timeout_called", "away_timeout_called", "lag_half", "type_abbreviation", 
+  "start_game_seconds_remaining", "lead_game_half", "game_half", "end_quarter_seconds_remaining",
+  "season_type", "home_team_spread", "game_spread", "game_spread_available"
+)
+
+pbp_l2m = pbp_l2m[, setdiff(names(pbp), to_drop_pbp)]
+```
+
+
+```{r}
+l2m = read.csv("/Users/john/Documents/L2M/L2M_stats_nba.csv")
+lines = read.csv("/Users/john/Documents/L2M/NBA_Basic.csv")
+
+lines = lines |>
+  filter(Date > 20150300)
+
+to_drop_l2m = c(
+  "time", "game_details", "page", "file", "game_date", "home", "away", 
+  "gcode", "game_id", "PCTime", "ImpossibleIndicator", "VideolLink", 
+  "Qualifier", "posID", "posStart", "posEnd", "posTeamId", "teamIdInFavor", 
+  "errorInFavor", "imgChart", "GameId", "GameDate", "HomeTeamId", 
+  "AwayTeamId", "L2M_Comments", "GAME_ID", "ATTENDANCE", "Game.ID", 
+  "OFFICIAL_ID_1","OFFICIAL_ID_2", "OFFICIAL_ID_3", "OFFICIAL_ID_4",
+  "ImposibleIndicator", "disadvantaged_min", "committing_min", "networks", 
+  "committing_team", "disadvantaged_team", "home_score", "away_score"
+)
+
+l2m = l2m[, setdiff(names(l2m), to_drop_l2m)]
+
+l2m = l2m |>
+  mutate(date = as.integer(gsub("-", "", date)),
+         period = as.integer(gsub("Q", "", period))) |>
+       #  time_sec = as.integer(ifelse(time_sec > 0 & time_sec == floor(time_sec), 
+        #                              floor(time_sec - 1), floor(time_sec)))) |>
+  rename(home = home_team, away = away_team) |>
+  filter((time_min <= 5 ) & !grepl("Test", comments))
+
+l2m = l2m |>
+  mutate(decision = case_when(
+    is.na(decision) & !grepl("\\[|\\]", comments) & !is.na(comments) &
+      !grepl("technical issue", comments) & !grepl("Instant Replay", call_type) & 
+      !grepl("All technical fouls", comments) & Difficulty != "Undetectable" ~ "INC",
+    TRUE ~ decision
+  )) |>
+  filter(!is.na(decision) & !grepl("\\[|\\]", comments) & 
+       !is.na(comments) & !grepl("technical issue", comments) & 
+         !grepl("Instant Replay", call_type) & !grepl("All technical fouls", comments) &
+         !(Difficulty %in% c("Undetectable")))
+
+to_drop_lines = c("Game.ID", "Away.Spread.Open", "Away.Spread.Close", 
+                  "Away.Spread.Open.Odds", "Away.Spread.Close.Odds", "Under.Open",
+                  "Under.Open.Odds", "Under.Close", "Under.Close.Odds", 
+                  "Home.Spread.Open.Odds", "Over.Open.Odds")
+
+lines = lines[, setdiff(names(lines), to_drop_lines)]
+```
+
+
+
+```{r}
+team_name_map = c(
+  "Atlanta" = "Hawks", "Boston" = "Celtics", "Brooklyn" = "Nets", "Charlotte" = "Hornets",
+  "Chicago" = "Bulls", "Cleveland" = "Cavaliers", "Dallas" = "Mavericks", 
+  "Denver" = "Nuggets", "Detroit" = "Pistons", "Golden State" = "Warriors", 
+  "Houston" = "Rockets", "Indiana" = "Pacers", "L.A. Clippers" = "Clippers", 
+  "L.A. Lakers" = "Lakers", "Memphis" = "Grizzlies", "Miami" = "Heat", "Milwaukee" = "Bucks",
+  "Minnesota" = "Timberwolves", "New Orleans" = "Pelicans", "New York" = "Knicks",
+  "Oklahoma City" = "Thunder", "Orlando" = "Magic", "Philadelphia" = "76ers",
+  "Phoenix" = "Suns", "Portland" = "Trail Blazers", "Sacramento" = "Kings",
+  "San Antonio" = "Spurs", "Toronto" = "Raptors", "Utah" = "Jazz", "Washington" = "Wizards"
+)
+
+lines = lines |>
+  mutate(
+    Home.Team = dplyr::recode(Home.Team, !!!team_name_map, .default = "Other"),
+    Away.Team = dplyr::recode(Away.Team, !!!team_name_map, .default = "Other")
+    ) |>
+  filter(Home.Team != "Other" & Away.Team != "Other") |>
+  rename(home = Home.Team, away = Away.Team, 
+         home_final = Home.Score, away_final = Away.Score, date = Date)
+
+l2m_lines = inner_join(l2m, lines, by = c("home", "away", "date"))
+```
+
+```{r}
+# For each game_id, find final home/away scores at the last row.
+df_outcomes = pbp_l2m |>
+  group_by(game_id) |>
+  summarise(
+    final_home_score = last(home_score),
+    final_away_score = last(away_score),
+    home_win_final   = as.integer(final_home_score > final_away_score)
+  )
+
+# Attach "home_win_final" to every row
+pbp_l2m = pbp_l2m |>
+  left_join(df_outcomes |> select(game_id, home_win_final), by = "game_id")
+```
+
+
+
+```{r}
+l2m2 = copy(l2m_lines)[l2m_lines$decision != "CNC",]
+
+l2m2 = l2m2 |>
+  mutate(game_sec = 60 * time_min + round(time_sec, 0))
+
+pbp2 = copy(pbp_l2m) |>
+  mutate(score_diff = home_score - away_score) |>
+  filter(!(type_id %in% c(16, 17, 584)))
+
+
+# Want to preserve the values in these columns
+keep_vals = c("home", "away", "date", "period", "start_sec", "end_sec", "gid",
+               "national_tv", "playoff", "season", "OFFICIAL_1", "OFFICIAL_2",
+               "OFFICIAL_3", "OFFICIAL_4", "away_final", "home_final", "Over.Close.Odds",
+               "Over.Close", "Home.Spread.Close.Odds", "Home.Spread.Close")
+
+all_cols = names(l2m2)
+
+cols_to_rename = setdiff(all_cols, keep_vals)
+
+setnames(l2m2, cols_to_rename, paste0("l2m_", cols_to_rename))
+
+setDT(l2m2)
+setDT(pbp2)
+
+
+l2m2[, l2m_row_id := .I]
+pbp2[, pbp_row_id := .I]
+
+l2m2[l2m_call_type == "24 second violation", l2m_call_type := "Shot Clock Violation"]
+pbp2[type_text == "8-Second Turnover", type_text := "8 Second Violation"]
+
+pbp2[, keep := TRUE]
+pbp2[, keep := !(any(type_text == "Offensive Foul") & type_text == "Offensive Foul Turnover"), 
+     by = .(date, period, game_sec)]
+pbp2 = pbp2[keep == TRUE]
+pbp2[, keep := NULL]
+
+l2m2[, start_sec := pmax(l2m_game_sec - 2, 0)]
+l2m2[, end_sec   := l2m_game_sec + 2]
+
+pbp2[, start_sec := game_sec]
+pbp2[, end_sec   := game_sec]
+
+pbp_no_score = pbp2[scoring_play == FALSE]
+
+setkey(l2m2, home, away, date, period, start_sec, end_sec)
+setkey(pbp_no_score, home, away, date, period, start_sec, end_sec)
+
+# Exclude scoring-play rows from pbp2 so they never get matched
+cand = foverlaps(
+  x       = l2m2,
+  y       = pbp_no_score,
+  type    = "any",
+  nomatch = 0L
+)
+
+
+setnames(cand, old = c("x.game_sec"), new = c("l2m_sec"), skip_absent = TRUE)
+
+cand[, time_diff := abs(game_sec - l2m_game_sec)]
+
+normalize_str = function(x, name = FALSE) {
+  # Lowercases and removes all non-alphanumeric, add spaces if not names
+  if (name == TRUE) {
+    gsub("[^a-z0-9]+", "", tolower(x))
+  }
+  else {
+    gsub("[^a-z0-9]+", " ", tolower(x))
+  }
+}
+
+call_type_in_text = function(ct, txt) {
+  if (is.na(ct) || is.na(txt) || ct == "" || txt == "") {
+    return(FALSE)
+  }
+
+  ct_clean  = normalize_str(ct) 
+  txt_clean = normalize_str(txt)
+  
+  ct_words  = unlist(strsplit(ct_clean, "\\s+"))
+  txt_words = unlist(strsplit(txt_clean, "\\s+"))
+  
+  length(intersect(ct_words, txt_words)) > 0
+}
+
+cand[, text_clean        := normalize_str(text, TRUE)]
+cand[, commit_clean      := normalize_str(l2m_committing, TRUE)]
+cand[, disadvantaged_clean := normalize_str(l2m_disadvantaged, TRUE)]
+
+cand[, name_match_score := 0L]
+cand[, call_type_match := 0L]
+
+call_type_in_text = Vectorize(call_type_in_text)
+cand[, call_type_match := as.integer(
+  call_type_in_text(l2m_call_type, type_text) | call_type_in_text(type_text, l2m_call_type)
+)]
+
+## If l2m committing/disadvantaged is non-empty, +1 if it appears in pbp$text
+invisible(
+  cand[ commit_clean != "",
+    name_match_score := name_match_score + 
+      mapply(function(pat, txt) {
+        as.integer(grepl(pat, txt, fixed = TRUE))
+      }, commit_clean, text_clean)
+  ]
+)
+
+invisible(
+  cand[ disadvantaged_clean != "",
+    name_match_score := name_match_score + 
+      mapply(function(pat, txt) {
+        as.integer(grepl(pat, txt, fixed = TRUE))
+      }, disadvantaged_clean, text_clean)
+  ]
+)
+
+setorder(cand, date, period, home, away, -call_type_match, -name_match_score, time_diff)
+
+# After your current best_match is computed:
+best_match = cand[scoring_play == FALSE & (call_type_match > 0 | name_match_score > 0), .SD[1], by=.(l2m_row_id)]
+best_match_dedup = best_match[order(time_diff), .SD[1], by = .(pbp_row_id)]
+
+# Update your matched pbp ids based on the deduplicated table
+matched_pbp_ids  = best_match_dedup$pbp_row_id
+matched_l2m_ids  = best_match_dedup$l2m_row_id
+
+# And recompute unmatched_pbp accordingly
+unmatched_pbp = pbp2[ !(pbp_row_id %in% matched_pbp_ids) & scoring_play == FALSE]
+unmatched_l2m = l2m2[ !(l2m_row_id %in% matched_l2m_ids)]
+
+# Now, when you rbind everything together, use best_match_dedup
+final = rbind(best_match_dedup, unmatched_l2m, unmatched_pbp, fill=TRUE)
+scoring_plays = pbp2[scoring_play == TRUE]
+final = rbind(final, scoring_plays, fill = TRUE)
+```
+
+```{r}
+to_drop_final = c("pbp_row_id", "l2m_row_id", "l2m_time_min", "l2m_time_sec", "start_sec", "end_sec", "game_time",
+          "l2m_call", "l2m_type", "l2m_type2", "l2m_time2", "l2m_game_sec",
+          "i.start_sec", "i.end_sec", "time_diff", "text_clean", "commit_clean",
+          "disadvantaged_clean", "name_match_score", "call_type_match", "source",
+          "time_min", "time_sec", "game_id")
+
+final = as.data.frame(final)
+final = final |>
+  mutate(l2m_game_sec = 60*l2m_time_min + l2m_time_sec,
+         game_sec = coalesce(game_sec, l2m_game_sec))
+
+df = final[, setdiff(names(final), to_drop_final)]
+
+names(df) = sub("^l2m_", "", names(df))
+df = df |>
+  group_by(date, home, away) |>
+  fill(gid, .direction = "downup") |>
+  ungroup()
+
+first_non_na_or_na = function(x) {
+  tmp = na.omit(x)
+  if (length(tmp) == 0) NA else tmp[1]
+}
+
+df = df |>
+  group_by(home, away, date) |>
+  filter(!all(is.na(gid)) & !all(is.na(away_score))) |>
+  mutate(across(
+    c(
+      gid, national_tv, i.season, playoff,
+      OFFICIAL_1, OFFICIAL_2, OFFICIAL_3, OFFICIAL_4,
+      home_final, away_final,
+      Over.Open, Over.Close,
+      Home.Spread.Open, Home.Spread.Close
+    ),
+    ~ coalesce(.x, first_non_na_or_na(.x))
+  )) |>
+  ungroup()
+
+df = df[,c(seq(1,9,1), 24, 25, seq(10,23,1), seq(26,44,1))]
+
+df = df |>
+  group_by(gid) |>
+  arrange(-game_sec, .by_group = TRUE) |>
+  fill(home_score, away_score, score_diff, home_favorite, home_win_final, .direction = "up") |>
+  fill(home_score, away_score, score_diff, home_favorite, home_win_final, .direction = "down") |>
+  ungroup()
+
+# Get everything in chronological order
+df = df[order(df$gid, df$period, -df$game_sec, df$game_play_number), ]
+```
+
+
+
+```{r}
+sim_poss <- function() {
+  # shot type
+  shot_type <- sample(c("three", "two"), size = 1,
+                      prob = c(29/86.4, 57.4/86.4))
+  
+  # fouled on shot?
+  fouled <- rbinom(1, 1, prob = 0.195) == 1
+  
+  # simulate outcome
+  if (shot_type == "three") {
+    made <- rbinom(1, 1, prob = 0.355) == 1
+    if (fouled) {
+      # expected FT value
+      points <- if (made) 3 + 0.77 else 0 + (0.77 * 3)
+    } else {
+      points <- if (made) 3 else 0
+    }
+  } else {
+    made <- rbinom(1, 1, prob = 0.51) == 1
+    if (fouled) {
+      points <- if (made) 2 + 0.77 else 0 + (0.77 * 2)
+    } else {
+      points <- if (made) 2 else 0
+    }
+  }
+  # 12.6% chance of turnover
+  return(0.874*points)
+}
+```
+
+
+```{r}
+nonzero <- df %>%
+  group_by(gid) %>%
+  filter(max(period) == 4) %>% 
+  ungroup()
+
+# zeroes <- df %>%
+#   group_by(gid) |>
+#   filter(max(period) == 4 & (type_text == "End Game" | decision %in% c("IC", "INC")))
+# 
+# model_df <- bind_rows(nonzero, zeroes)
+model_df = nonzero
+model_df = model_df[order(model_df$gid, model_df$period, -model_df$game_sec, model_df$game_play_number), ]
+```
+
+```{r}
+model <- glm(home_win_final ~ score_diff * game_sec * home_favorite,
+             family = binomial(link = "logit"),
+             data = model_df)
+
+vif_values <- vif(model)
+print(vif_values)
+predictor_vars <- model_df[, c("score_diff", "game_sec")]
+cor_matrix <- cor(predictor_vars, use = "complete.obs")
+print(cor_matrix)
+```
+
+
+```{r}
+model_df$gid = as.factor(model_df$gid)
+model_df$score_diff_scaled <- scale(model_df$score_diff)
+model_df$game_sec_scaled <- scale(model_df$game_sec)
+model_df = model_df |>
+  mutate(call_sign = ifelse(decision %in% c("IC","INC"), ifelse(committing_side == "home", -1, 
+                            ifelse(committing_side == "away", 1, 0)), 0))
+
+# fit <- glmer(
+#   home_win_final ~ score_diff_scaled*game_sec + (1|Home.Spread.Close) + (1 | gid),
+#   data = model_df,
+#   family = binomial(link = "logit"),
+#   control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+# )
+# 
+# summary(fit)
+```
+
+```{r}
+cor(model_df$game_sec, model_df$score_diff)
+
+fit_glm <- glm(home_win_final ~ score_diff*game_sec*home_favorite,
+               data = model_df,
+               family = binomial(link = "logit"))
+summary(fit_glm)
+
+bad_df = model_df |>
+  group_by(gid) |>
+  filter(any(decision %in% c("IC","INC"))) |>
+  ungroup()
+
+bad_df$gid <- droplevels(bad_df$gid)
+bad_df = bad_df[order(bad_df$gid, -bad_df$game_sec, bad_df$game_play_number), ]
+
+worse_df <- bad_df %>%
+  group_by(gid) %>%
+  filter(abs(sum(call_sign)) > 1) %>%
+  ungroup()
+worse_df$gid <- droplevels(worse_df$gid)
+worse_df = worse_df[order(worse_df$gid, -worse_df$game_sec, worse_df$game_play_number), ]
+bad_list <- split(bad_df, bad_df$gid)
+
+# compute the cluster-robust vcov matrix
+cluster_vcov <- vcovCL(fit_glm, cluster = model_df$gid)
+
+# display coefs with the clustered standard errors
+coeftest(fit_glm, cluster_vcov)
+```
+
+
+
+```{r}
+fit_glm <- glm(home_win_final ~ score_diff*game_sec + game_sec*home_favorite,
+               data = model_df,
+               family = binomial(link = "logit"))
+summary(fit_glm)
+```
+
+
+
+```{r}
+forward_prediction <- function(df_game, fit_glm) {
+  # Predict returns a vector of predictions for each row.
+  # We’ll use the final row’s prediction as our “final win probability.”
+  pred_vec <- predict(fit_glm, newdata = df_game, type = "response")
+  return(pred_vec)
+}
+```
+
+
+```{r}
+sim_cf_game <- function(df_game, fit_glm, n_sims = 1000) {
+  df_game <- df_game[order(df_game$game_sec, decreasing = TRUE), ]
+  n <- nrow(df_game)
+  
+  # get the original predictions
+  orig_preds <- predict(fit_glm, newdata = df_game, type = "response")
+  
+  # find refereeing mistakes
+  call_indices <- which(df_game$decision %in% c("IC", "INC"))
+  
+  if(length(call_indices) == 0) {
+    return(rep(0, n_sims))
+  }
+  
+  start_int <- min(call_indices)
+  integrated_impacts <- numeric(n_sims)
+  
+  for (sim in seq_len(n_sims)) {
+    df_cf <- df_game
+    
+    # for each detected call, simulate a correction and add it cumulatively
+    for (j in call_indices) {
+      adjustment <- df_game$call_sign[j] * sim_poss()
+      df_cf$score_diff[j:n] <- df_cf$score_diff[j:n] + adjustment
+    }
+    
+    # predict counterfactual win probs using modified score diffs
+    cf_preds <- predict(fit_glm, newdata = df_cf, type = "response")
+    
+    # compute integrated impact over the window
+    integrated_impacts[sim] <- mean(cf_preds[start_int:n] - orig_preds[start_int:n])
+  }
+  
+  return(integrated_impacts)
+}
+```
+
+```{r}
+pre_df <- subset(worse_df, date < 20180809)
+
+mgm_df <- subset(worse_df, date >= 20180809 & date <= 20211104)
+pre_df$gid <- droplevels(pre_df$gid)
+mgm_df$gid <- droplevels(mgm_df$gid)
+
+dk_df <- subset(worse_df, date > 20211104)
+dk_df$gid <- droplevels(dk_df$gid)
+mgm_list = split(mgm_df, mgm_df$gid)
+pre_list = split(pre_df, pre_df$gid)
+dk_list = split(dk_df, dk_df$gid)
+results_list <- vector("list", length(pre_list))
+for (g in seq_along(pre_list)) {
+  df_game <- pre_list[[g]]
+  
+  impact_vec <- sim_cf_game(df_game, fit_glm, n_sims = 100)
+  
+  results_list[[g]] <- impact_vec
+}
+
+impact_summary <- data.frame(
+  game_id = sapply(pre_list, function(df) as.character(df$gid[1])),
+  mean_impact = sapply(results_list, mean),
+  lower_impact = sapply(results_list, quantile, probs = 0.025, na.rm = T),
+  upper_impact = sapply(results_list, quantile, probs = 0.975, na.rm = T)
+)
+
+print(impact_summary)
+
+mean(abs(impact_summary$mean_impact), na.rm=T)
+```
+
+
+```{r}
+ggplot(impact_summary, aes(x = reorder(game_id, mean_impact), y = mean_impact)) +
+  geom_errorbar(aes(ymin = lower_impact, ymax = upper_impact), width = 0.1, color = "darkblue") +
+  coord_flip() +
+  labs(title = "Net Impact on Win Probability by Game",
+       x = "",
+       y = "Net Change in Win Probability") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank())
+```
+
+```{r}
+ggplot(impact_summary, aes(x = mean_impact)) +
+  geom_histogram(binwidth = 0.05, fill = "royalblue1", color = "black") +
+  labs(title = "Mean Impact on Win Probability Across Games",
+       x = "Mean Change in Win Probability",
+       y = "Number of Games")
+```
+
+
+
+```{r}
+simulate_cf_game_reps <- function(df_game, fit_glm, n_sims = 1000) {
+  # Ensure the game data is sorted in descending order by game_sec,
+  # since game_sec represents time remaining (highest = early, 0 = game end).
+  df_game <- df_game[order(df_game$game_sec, decreasing = TRUE), ]
+  n <- nrow(df_game)
+  
+  # Matrix to store cf predictions at each simulation. Each row is one simulation; each column corresponds to an event.
+  sim_cf_mat <- matrix(NA, nrow = n_sims, ncol = n)
+  
+  # Loop over simulations
+  for (sim in seq_len(n_sims)) {
+    # Make a working copy of the data frame.
+    df_cf <- df_game
+    
+    # Initialize cumulative adjustment vector.
+    cum_adj <- rep(0, n)
+    
+    # Find indices at which an officiating error occurs.
+    call_indices <- which(df_cf$decision %in% c("IC", "INC"))
+    
+    # For each call, adjust the score_diff from that event onward.
+    if (length(call_indices) > 0) {
+      for (j in seq_along(call_indices)) {
+        idx <- call_indices[j]
+        # Adjust using sim_poss(); call_sign should be numeric (+1 or -1)
+        adjustment <- df_cf$call_sign[idx] * sim_poss()
+        # Add this adjustment cumulatively from this event through the end.
+        cum_adj[idx:n] <- cum_adj[idx:n] + adjustment
+      }
+    }
+    
+    # Create the counterfactual score difference.
+    df_cf$cf_score_diff <- df_cf$score_diff + cum_adj
+    
+    # For counterfactual prediction, we assume that the only change is in score_diff.
+    # Copy df_cf into a new frame for prediction; here, we overwrite score_diff.
+    df_pred <- df_cf
+    df_pred$score_diff <- df_cf$cf_score_diff
+    
+    # Get the predicted win probability at each event.
+    cf_preds <- predict(fit_glm, newdata = df_pred, type = "response")
+    sim_cf_mat[sim, ] <- cf_preds
+  }
+  
+  # Return a list with the time points and the simulation matrix.
+  return(list(game_sec = df_game$game_sec, cf_mat = sim_cf_mat))
+}
+
+summarize_simulations <- function(sim_results) {
+  # sim_results is a list with game_sec (a vector) and cf_mat (n_sims x n matrix)
+  # Compute the summary statistics (mean, lower, upper) for each time step (i.e., for each column)
+  mean_cf <- apply(sim_results$cf_mat, 2, mean)
+  lower_cf <- apply(sim_results$cf_mat, 2, quantile, probs = 0.025)
+  upper_cf <- apply(sim_results$cf_mat, 2, quantile, probs = 0.975)
+  
+  # Build and return a data frame with results.
+  summary_df <- data.frame(
+    game_sec = sim_results$game_sec,
+    mean_cf = mean_cf,
+    lower_cf = lower_cf,
+    upper_cf = upper_cf
+  )
+  
+  return(summary_df)
+}
+
+```
+
+
+
+```{r}
+plot_cf_trajectory <- function(summary_df, orig_preds) {
+  orig_df <- data.frame(
+    game_sec = summary_df$game_sec,
+    orig_pred = orig_preds
+  )
+
+  ggplot() +
+    # Confidence band for counterfactual predictions:
+    geom_ribbon(data = summary_df, 
+                aes(x = game_sec, ymin = lower_cf, ymax = upper_cf, fill = "Counterfactual"),
+                alpha = 0.3) +
+    # Mean counterfactual win probability:
+    geom_line(data = summary_df, 
+              aes(x = game_sec, y = mean_cf, color = "Counterfactual"),
+              size = 1) +
+    # Original predicted win probability:
+    geom_line(data = orig_df, 
+              aes(x = game_sec, y = orig_pred, color = "Original"),
+              linetype = "dashed", size = 1) +
+    scale_color_manual(name = "Win Probability", 
+                       values = c("Counterfactual" = "red", "Original" = "blue"),
+                       guide = guide_legend(order = 1)) +
+    scale_fill_manual(name = "Win Probability",
+      values = c("Counterfactual" = "red"),
+      guide = "none") + 
+    scale_x_reverse() +  # Reverse the x-axis: high game_sec (more time remaining) to 0 (end).
+    labs(title = "Win Probability Trajectory",
+         x = "Seconds Remaining",
+         y = "Win Probability")
+}
+
+```
+
+
+```{r}
+# Run the simulation (e.g., 200 replicates) for one game.
+sim_results <- simulate_cf_game_reps(bad_list[[110]], fit_glm, n_sims = 200)
+
+# Summarize the simulation results.
+summary_df <- summarize_simulations(sim_results)
+
+# Get the original predictions for each event (for plotting).
+orig_preds <- predict(fit_glm, newdata = bad_list[[110]], type = "response")
+
+# Plot the trajectories.
+plot_cf_trajectory(summary_df, orig_preds)
+
+bad_list[[196]]
+```
+
+
+```{r}
+set.seed(7252)
+sample_games <- sample(1:531, 4, replace = FALSE)
+
+plot_list <- vector("list", length(sample_games))
+
+for(i in seq_along(sample_games)) {
+  game_idx <- sample_games[i]
+  
+  df_game <- bad_list[[game_idx]]
+  
+  sim_results <- simulate_cf_game_reps(df_game, fit_glm, n_sims = 500)
+  
+  summary_df <- summarize_simulations(sim_results)
+  
+  orig_preds <- predict(fit_glm, newdata = df_game, type = "response")
+  
+  p <- plot_cf_trajectory(summary_df, orig_preds) +
+         ggtitle(paste("Game", game_idx))
+  
+  plot_list[[i]] <- p
+}
+
+legend <- get_legend(
+  plot_list[[1]] +
+    theme(legend.position = "top")
+)
+
+plot_list_no_legend <- lapply(plot_list, function(p) {
+  p + theme(legend.position = "none")
+})
+
+combined_plot <- plot_grid(
+  legend,
+  plot_grid(plotlist = plot_list_no_legend, ncol = 2),
+  ncol = 1,
+  rel_heights = c(0.1, 1) 
+)
+
+print(combined_plot)
+```
